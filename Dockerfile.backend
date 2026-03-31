@@ -1,0 +1,28 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Dockerfile.backend — NOT USED / DO NOT BUILD
+#
+# The WiFi Pentesting Suite backend CANNOT run inside Docker because:
+#
+#   1. airmon-ng / iw require direct access to the Linux kernel's
+#      nl80211 / cfg80211 / mac80211 subsystem — which is a HOST-only layer.
+#
+#   2. USB WiFi adapters (monitor mode) need their kernel module
+#      (e.g. rtl8821au.ko) loaded on the HOST. Docker containers cannot
+#      load kernel modules, and USB passthrough does not expose the
+#      phy-layer interface needed by airmon-ng.
+#
+#   3. aircrack-ng packet injection (aireplay-ng) requires a real
+#      raw socket bound to a monitor-mode interface on the host phy.
+#      This is not achievable from a container network namespace.
+#
+# ✅ CORRECT DEPLOYMENT:
+#
+#   Run the backend NATIVELY on Kali Linux as root:
+#
+#       cd backend
+#       pip3 install -r requirements.txt
+#       alembic upgrade head
+#       sudo uvicorn main:app --host 0.0.0.0 --port 8000
+#
+#   See README.md → Installation section for full setup instructions.
+# ─────────────────────────────────────────────────────────────────────────────

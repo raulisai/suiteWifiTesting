@@ -1,0 +1,37 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# WiFi Pentesting Suite — docker-compose (FRONTEND ONLY)
+#
+# ⚠️  The BACKEND cannot and must not run in Docker.
+#
+#     airmon-ng / airodump-ng / reaver operate at the Linux kernel level
+#     (nl80211 / cfg80211 / mac80211). They require:
+#       • Kernel modules (e.g. rtl8821au) loaded on the HOST
+#       • Direct access to the physical WiFi phy layer
+#       • Root privileges on the HOST OS — not inside a container namespace
+#
+#     USB WiFi adapters in monitor mode are NOT reliably passable to Docker
+#     containers, even with --privileged + --device + --net=host. The kernel
+#     module must be loaded on the host and airmon-ng must see the real phy.
+#
+#     ✅ Correct deployment:
+#         1. Run backend NATIVELY on Kali Linux (see README.md)
+#                cd backend && sudo uvicorn main:app --host 0.0.0.0 --port 8000
+#         2. (Optional) Run this compose for the frontend container:
+#                docker compose up --build
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: "3.9"
+
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: wifi_suite_frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    # host.docker.internal resolves to the host machine where the backend
+    # is running natively on port 8000.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
