@@ -143,7 +143,8 @@ export function KineticTerminal() {
 
           {/* Central panel */}
           <div className="flex-1 relative min-w-0">
-            {view === 'map' ? (
+            {/* NetworkMap stays mounted but hidden to preserve state */}
+            <div className={view === 'map' ? 'absolute inset-0' : 'hidden'}>
               <NetworkMap
                 networks={networks}
                 scanning={scanning}
@@ -156,7 +157,8 @@ export function KineticTerminal() {
                 onStop={stopScan}
                 filter={mapFilter}
               />
-            ) : view === 'console' ? (
+            </div>
+            {view === 'console' && (
               <AttackConsole
                 networks={networks}
                 initialTarget={attackTarget}
@@ -165,13 +167,10 @@ export function KineticTerminal() {
                 setAttackLines={setAttackLines}
                 pushAlert={pushAlert}
               />
-            ) : view === 'campaigns' ? (
-              <KineticCampaigns />
-            ) : view === 'credentials' ? (
-              <KineticCredentials />
-            ) : (
-              <KineticReports />
             )}
+            {view === 'campaigns' && <KineticCampaigns />}
+            {view === 'credentials' && <KineticCredentials />}
+            {view === 'reports' && <KineticReports />}
           </div>
 
 

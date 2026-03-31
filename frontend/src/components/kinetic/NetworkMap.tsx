@@ -661,33 +661,34 @@ export function NetworkMap({ networks, scanning, onAttack, onStart, onStop, filt
     const H = (canvas && canvas.offsetHeight > 0) ? canvas.offsetHeight : 600
 
     const h = bssidHash(n.bssid)
-
-    // Two independent 16-bit slices → independent X and Y in [0, 1)
-    const tx = (h & 0xffff) / 0x10000
-    const ty = ((h >>> 16) & 0xffff) / 0x10000
-
-    // Spread across the full rectangular canvas with margin to keep labels readable
-    const mx = 56, my = 44
-    let x = mx + tx * (W - mx * 2)
-    let y = my + ty * (H - my * 2)
-
-    // Push nodes out of the center button's dead zone (radius 68px)
     const cx = W / 2, cy = H / 2
-    const dx = x - cx, dy = y - cy
-    const dist = Math.sqrt(dx * dx + dy * dy)
-    const dead = 68
-    if (dist < dead) {
-      // Radially push to the dead zone boundary, preserving direction
-      const s = dist > 0 ? dead / dist : 1
-      x = cx + dx * s
-      y = cy + dy * s
-    }
+
+    // Angle based on BSSID hash (consistent position around center)
+    const angle = ((h % 3600) / 3600) * Math.PI * 2
+
+    // Distance based on signal strength:
+    // Strong signal (-30 dBm) = close to center, Weak signal (-95 dBm) = far from center
+    const power = n.power ?? -80
+    // Normalize: -30 dBm → 0 (closest), -95 dBm → 1 (farthest)
+    const signalNorm = Math.max(0, Math.min(1, (power + 30) / -65))
+
+    // Min radius = 70 (dead zone), Max radius = 90% of half the smaller dimension
+    const minRadius = 70
+    const maxRadius = Math.min(W, H) * 0.42
+    const radius = minRadius + signalNorm * (maxRadius - minRadius)
+
+    // Add small offset based on hash to avoid overlapping networks with same signal
+    const offsetAngle = ((h >>> 12) & 0xff) / 255 * 0.3 - 0.15  // ±0.15 radians
+    const finalAngle = angle + offsetAngle
+
+    const x = cx + Math.cos(finalAngle) * radius
+    const y = cy + Math.sin(finalAngle) * radius
 
     return {
       network: n,
       x,
       y,
-      size: 7 + Math.abs((n.power ?? -80) + 50) * 0.18,
+      size: 7 + Math.abs((power + 50) * 0.18),
       pulse: Math.random() * Math.PI * 2,
       enterT: 0,
     }
@@ -695,12 +696,39 @@ export function NetworkMap({ networks, scanning, onAttack, onStart, onStop, filt
   }, [])
 
   useEffect(() => {
+    const canvas = canvasRef.current
+    const W = (canvas && canvas.offsetWidth  > 0) ? canvas.offsetWidth  : 900
+    const H = (canvas && canvas.offsetHeight > 0) ? canvas.offsetHeight : 600
+    const cx = W / 2, cy = H / 2
+    const minRadius = 70
+    const maxRadius = Math.min(W, H) * 0.42
+
     const existingBssids = new Set(nodesRef.current.map(nd => nd.network.bssid))
 
-    // update existing nodes' live data (power, wps flags, etc.)
+    // update existing nodes' live data AND reposition based on signal
     nodesRef.current = nodesRef.current.map(nd => {
       const fresh = networks.find(n => n.bssid === nd.network.bssid)
-      return fresh ? { ...nd, network: fresh } : nd
+      if (!fresh) return nd
+
+      // Recalculate target position based on current signal
+      const h = bssidHash(fresh.bssid)
+      const angle = ((h % 3600) / 3600) * Math.PI * 2
+      const offsetAngle = ((h >>> 12) & 0xff) / 255 * 0.3 - 0.15
+      const finalAngle = angle + offsetAngle
+
+      const power = fresh.power ?? -80
+      const signalNorm = Math.max(0, Math.min(1, (power + 30) / -65))
+      const targetRadius = minRadius + signalNorm * (maxRadius - minRadius)
+
+      const targetX = cx + Math.cos(finalAngle) * targetRadius
+      const targetY = cy + Math.sin(finalAngle) * targetRadius
+
+      // Smooth interpolation towards target (lerp factor 0.08)
+      const lerp = 0.08
+      const newX = nd.x + (targetX - nd.x) * lerp
+      const newY = nd.y + (targetY - nd.y) * lerp
+
+      return { ...nd, network: fresh, x: newX, y: newY }
     })
 
     // append brand-new nodes — they enter with enterT=0 (animated in draw loop)
@@ -759,8 +787,11 @@ export function NetworkMap({ networks, scanning, onAttack, onStart, onStop, filt
       nodesRef.current.forEach(nd => {
         const matchSearch = !searchQ || (nd.network.ssid ?? nd.network.bssid).toLowerCase().includes(searchQ)
         const dim = (fhf && !fb.has(nd.network.bssid)) || !matchSearch
+        const isSel = selected?.bssid===nd.network.bssid
         ctx.beginPath(); ctx.moveTo(W/2,H/2); ctx.lineTo(nd.x,nd.y)
-        ctx.strokeStyle = dim ? 'rgba(45,45,45,0.06)' : `${SG_RGBA}0.07)`; ctx.lineWidth=0.5; ctx.stroke()
+        // Lines: brighter only when selected
+        ctx.strokeStyle = dim ? 'rgba(45,45,45,0.04)' : isSel ? `${SG_RGBA}0.25)` : `${SG_RGBA}0.04)`
+        ctx.lineWidth = isSel ? 1 : 0.5; ctx.stroke()
       })
 
       nodesRef.current.forEach(nd => {
@@ -776,14 +807,14 @@ export function NetworkMap({ networks, scanning, onAttack, onStart, onStop, filt
         const pct   = signalPct(nd.network.power)
         const sCol  = signalColor(pct)
 
-        // ── entry ping ring ───────────────────────────────────────────────────
+        // ── entry ping ring (subtle, only bright if selected) ──────────────────
         if (nd.enterT < 0.85 && !dim) {
           const pingProgress = nd.enterT / 0.85
-          const pingR  = nd.size * (1 + pingProgress * 5)
-          const pingA  = (1 - pingProgress) * (isSel ? 0.5 : 0.35)
+          const pingR  = nd.size * (1 + pingProgress * 3)
+          const pingA  = (1 - pingProgress) * (isSel ? 0.45 : 0.15)
           ctx.beginPath(); ctx.arc(nd.x, nd.y, pingR, 0, Math.PI * 2)
           ctx.strokeStyle = `rgba(42,255,138,${pingA.toFixed(2)})`
-          ctx.lineWidth = 1.5; ctx.stroke()
+          ctx.lineWidth = isSel ? 1.5 : 0.8; ctx.stroke()
         }
 
         if (dim) {
@@ -808,14 +839,14 @@ export function NetworkMap({ networks, scanning, onAttack, onStart, onStop, filt
           ctx.globalAlpha=1; return
         }
 
-        // normal — signal-intensity color
-        const alpha = (pulse*0.14).toFixed(2)
-        ctx.beginPath(); ctx.arc(nd.x,nd.y,r+4+pulse*4,0,Math.PI*2)
-        ctx.strokeStyle=sCol.replace(/[\d.]+\)$/,`${alpha})`); ctx.lineWidth=1; ctx.stroke()
+        // normal — subtle, more transparent (only bright when selected)
+        const alpha = (pulse*0.06).toFixed(2)
+        ctx.beginPath(); ctx.arc(nd.x,nd.y,r+2+pulse*2,0,Math.PI*2)
+        ctx.strokeStyle=sCol.replace(/[\d.]+\)$/,`${alpha})`); ctx.lineWidth=0.5; ctx.stroke()
         ctx.beginPath(); ctx.arc(nd.x,nd.y,r,0,Math.PI*2)
-        ctx.fillStyle=sCol.replace(/[\d.]+\)$/,'0.70)'); ctx.shadowColor=sCol; ctx.shadowBlur=4; ctx.fill(); ctx.shadowBlur=0
-        ctx.globalAlpha=eased
-        ctx.fillStyle=sCol.replace(/[\d.]+\)$/,'0.48)'); ctx.font='9px monospace'
+        ctx.fillStyle=sCol.replace(/[\d.]+\)$/,'0.28)'); ctx.fill()
+        ctx.globalAlpha=eased * 0.5
+        ctx.fillStyle=sCol.replace(/[\d.]+\)$/,'0.35)'); ctx.font='8px monospace'
         ctx.fillText(nd.network.ssid??nd.network.bssid.slice(-8),nd.x+r+3,nd.y+3)
         ctx.globalAlpha=1
       })
