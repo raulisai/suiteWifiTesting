@@ -3,16 +3,51 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict
 from datetime import datetime
 from pathlib import Path
-import binascii
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.deps import get_session
 from app.models.credential import Credential
 from app.models.handshake import Handshake
 from app.models.network import Network
 
 router = APIRouter(prefix="/api/credentials", tags=["credentials"])
+
+_WORDLIST_EXTS = {".txt", ".lst", ".wordlist", ".dict"}
+
+
+@router.get("/wordlists")
+async def list_wordlists() -> list[dict]:
+    """Scan wordlists_dir (and work_dir) for dictionary files.
+    Returns [{name, path, size_mb}] sorted by name.
+    """
+    found: list[dict] = []
+
+    def _scan(root: Path) -> None:
+        if not root.exists():
+            return
+        for p in sorted(root.rglob("*")):
+            if p.is_file() and p.suffix.lower() in _WORDLIST_EXTS:
+                try:
+                    size_mb = round(p.stat().st_size / 1_048_576, 1)
+                except OSError:
+                    size_mb = 0.0
+                found.append({"name": p.name, "path": str(p), "size_mb": size_mb})
+
+    _scan(Path(settings.wordlists_dir))
+    # also surface any wordlists dropped into the captures dir
+    _scan(Path(settings.work_dir))
+
+    # deduplicate by path
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for item in found:
+        if item["path"] not in seen:
+            seen.add(item["path"])
+            unique.append(item)
+
+    return unique
 
 
 class CredentialResponse(BaseModel):

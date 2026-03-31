@@ -115,7 +115,7 @@ export function AttackConsole({
         setAttackLines(prev => [...prev.slice(-500), ev.message!])
       }
 
-      if (ev.type === 'data' && ev.data) {
+      if (ev.type === 'credential' && ev.data) {
         const d = ev.data as Record<string, unknown>
         if (d.password)  pushAlert('crack',     'PASSWORD FOUND',   String(d.password))
         if (d.pin)       pushAlert('crack',     'WPS PIN FOUND',    String(d.pin))

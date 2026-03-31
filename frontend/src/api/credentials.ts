@@ -17,6 +17,9 @@ export const credentialsApi = {
   deleteHandshake: (id: number) =>
     apiClient.delete(`/api/credentials/handshakes/${id}`),
 
+  listWordlists: () =>
+    apiClient.get<{ name: string; path: string; size_mb: number }[]>('/api/credentials/wordlists').then((r) => r.data),
+
   handshakeContent: (id: number) =>
     apiClient.get<string>(`/api/credentials/handshakes/${id}/content`, {
       responseType: 'text',

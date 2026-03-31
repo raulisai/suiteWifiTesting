@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Cell } from 'recharts'
 import { environmentApi, type ToolInfo } from '../../api/environment'
 import type { Network } from '../../types/network'
+import { isVulnerable } from '../../utils/networkFilters'
 
 interface Props {
   networks: Network[]
@@ -16,11 +17,7 @@ function KineticSignalMini({ networks }: { networks: Network[] }) {
     .map((n) => ({
       name: (n.ssid ?? n.bssid.slice(-8)).slice(0, 14),
       power: n.power ?? -100,
-      vuln:
-        (n.wps_enabled && !n.wps_locked) ||
-        n.encryption === 'WEP' ||
-        !n.encryption ||
-        n.encryption === 'OPN',
+      vuln: isVulnerable(n),
     }))
 
   if (!data.length) {

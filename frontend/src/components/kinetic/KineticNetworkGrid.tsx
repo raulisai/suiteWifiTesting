@@ -1,8 +1,12 @@
 import { useState, useMemo } from 'react'
 import type { Network } from '../../types/network'
 import type { KineticAlert } from '../../pages/KineticTerminal'
-
-type NetFilter = 'all' | 'wpa' | 'wps' | 'open' | 'wep'
+import {
+  FILTER_DEFS,
+  type MapFilter,
+  isVulnerable,
+  getEncryptionColor,
+} from '../../utils/networkFilters'
 
 interface Props {
   networks: Network[]
@@ -10,78 +14,21 @@ interface Props {
   onAttack: (network: Network) => void
 }
 
-interface FilterDef {
-  key: NetFilter
-  label: string
-  sublabel: string
-  color: string
-  match: (n: Network) => boolean
-}
-
-const FILTERS: FilterDef[] = [
-  {
-    key: 'all',
-    label: 'TODAS',
-    sublabel: 'Access Points',
-    color: '#2aff8a',
-    match: () => true,
-  },
-  {
-    key: 'wpa',
-    label: 'WPA/WPA2',
-    sublabel: 'Handshake · PMKID',
-    color: '#ffaa00',
-    match: (n) => !!n.encryption?.toUpperCase().includes('WPA'),
-  },
-  {
-    key: 'wps',
-    label: 'WPS',
-    sublabel: 'Pixie Dust · Brute',
-    color: '#ff6b35',
-    match: (n) => !!(n.wps_enabled && !n.wps_locked),
-  },
-  {
-    key: 'open',
-    label: 'ABIERTAS',
-    sublabel: 'Sin cifrado',
-    color: '#ff4444',
-    match: (n) => !n.encryption || n.encryption === 'OPN',
-  },
-  {
-    key: 'wep',
-    label: 'WEP',
-    sublabel: 'Cifrado roto',
-    color: '#cc2222',
-    match: (n) => n.encryption?.toUpperCase() === 'WEP',
-  },
-]
-
 // ── Single network card ───────────────────────────────────────────────────────
 function NetworkCard({ n, onAttack }: { n: Network; onAttack: () => void }) {
-  const isVuln =
-    !n.encryption ||
-    n.encryption === 'OPN' ||
-    n.encryption?.toUpperCase() === 'WEP' ||
-    (n.wps_enabled && !n.wps_locked)
-
-  const encColor = !n.encryption || n.encryption === 'OPN'
-    ? '#ff4444'
-    : n.encryption?.toUpperCase() === 'WEP'
-    ? '#cc2222'
-    : n.encryption?.toUpperCase().includes('WPA')
-    ? '#ffaa00'
-    : '#2aff8a'
+  const vuln = isVulnerable(n)
+  const encColor = getEncryptionColor(n)
 
   return (
     <div
       className="relative border rounded p-3 transition-all group cursor-default"
       style={{
-        borderColor: isVuln ? 'rgba(255,107,53,0.18)' : 'rgba(42,255,138,0.08)',
-        background: isVuln ? 'rgba(255,107,53,0.03)' : 'rgba(10,20,10,0.25)',
+        borderColor: vuln ? 'rgba(255,107,53,0.18)' : 'rgba(42,255,138,0.08)',
+        background: vuln ? 'rgba(255,107,53,0.03)' : 'rgba(10,20,10,0.25)',
       }}
     >
       {/* Vuln indicator top-right corner */}
-      {isVuln && (
+      {vuln && (
         <span
           className="absolute top-2 right-2 w-1.5 h-1.5 rounded-full"
           style={{ background: '#ff6b35', boxShadow: '0 0 6px rgba(255,107,53,0.8)' }}
@@ -163,18 +110,18 @@ function NetworkCard({ n, onAttack }: { n: Network; onAttack: () => void }) {
 
 // ── Main grid component ───────────────────────────────────────────────────────
 export function KineticNetworkGrid({ networks, pushAlert, onAttack }: Props) {
-  const [activeFilter, setActiveFilter] = useState<NetFilter>('all')
+  const [activeFilter, setActiveFilter] = useState<MapFilter>('all')
 
   const counts = useMemo(
     () =>
       Object.fromEntries(
-        FILTERS.map((f) => [f.key, networks.filter(f.match).length])
-      ) as Record<NetFilter, number>,
+        FILTER_DEFS.map((f) => [f.key, networks.filter(f.match).length])
+      ) as Record<MapFilter, number>,
     [networks]
   )
 
   const filtered = useMemo(
-    () => networks.filter(FILTERS.find((f) => f.key === activeFilter)!.match),
+    () => networks.filter(FILTER_DEFS.find((f) => f.key === activeFilter)!.match),
     [networks, activeFilter]
   )
 
@@ -183,7 +130,7 @@ export function KineticNetworkGrid({ networks, pushAlert, onAttack }: Props) {
 
       {/* ── Filter chips ─────────────────────────────────────────────────── */}
       <div className="flex gap-2 flex-wrap px-4 py-3 border-b border-[#1a2f1a] shrink-0">
-        {FILTERS.map(({ key, label, sublabel, color }) => {
+        {FILTER_DEFS.map(({ key, label, sublabel, color }) => {
           const active = activeFilter === key
           const count  = counts[key]
           const dim    = count === 0

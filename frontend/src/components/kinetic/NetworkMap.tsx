@@ -1,32 +1,26 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import type { Network } from '../../types/network'
+import { useCredentialsStore } from '../../store/credentials'
+import {
+  FILTER_DEFS,
+  type MapFilter,
+  isVulnerable,
+  encLabel,
+  signalPct,
+  signalColor,
+} from '../../utils/networkFilters'
 
-// ── Soft green – used for ALL active nodes ─────────────────────────────────
-const SOFT_GREEN      = '#2aff8a'
-const SOFT_GREEN_RGBA = 'rgba(42,255,138,'
-
-// ── Filter types & definitions ─────────────────────────────────────────────
-export type MapFilter = 'all' | 'wpa' | 'wps' | 'open' | 'wep'
-
-interface FilterDef {
-  key: MapFilter
-  label: string
-  color: string
-  match: (n: Network) => boolean
-}
-
-const FILTER_DEFS: FilterDef[] = [
-  { key: 'all',  label: 'ALL',  color: '#2aff8a', match: ()  => true },
-  { key: 'wpa',  label: 'WPA',  color: '#2aff8a', match: (n) => !!n.encryption?.toUpperCase().includes('WPA') },
-  { key: 'wps',  label: 'WPS',  color: '#2aff8a', match: (n) => !!(n.wps_enabled && !n.wps_locked) },
-  { key: 'open', label: 'OPEN', color: '#2aff8a', match: (n) => !n.encryption || n.encryption === 'OPN' },
-  { key: 'wep',  label: 'WEP',  color: '#2aff8a', match: (n) => n.encryption?.toUpperCase() === 'WEP' },
-]
+// ── constants ─────────────────────────────────────────────────────────────────
+const SG      = '#2aff8a'
+const SG_RGBA = 'rgba(42,255,138,'
 
 interface Props {
   networks: Network[]
   scanning: boolean
   onAttack: (n: Network) => void
+  onStart?: () => void
+  onStop?: () => void
+  filter: MapFilter
 }
 
 interface MapNode {
@@ -35,487 +29,1024 @@ interface MapNode {
   y: number
   size: number
   pulse: number
+  enterT: number   // 0 = just appeared → 1 = fully visible
 }
 
-function encLabel(enc: string | null): string {
-  if (!enc) return 'OPEN'
-  return enc
-}
 
-function signalPct(power: number | null | undefined): number {
-  const p = power ?? -95
-  return Math.max(0, Math.min(100, Math.round(((p + 95) / 60) * 100)))
-}
-
-/* deterministic scatter based on bssid hash */
 function bssidHash(bssid: string): number {
   let h = 0
   for (let i = 0; i < bssid.length; i++) h = (h * 31 + bssid.charCodeAt(i)) >>> 0
   return h
 }
 
-export function NetworkMap({ networks, scanning, onAttack }: Props) {
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-  const nodesRef  = useRef<MapNode[]>([])
-  const frameRef  = useRef(0)
-  const [hovered,  setHovered]  = useState<Network | null>(null)
-  const [tooltip,  setTooltip]  = useState({ x: 0, y: 0 })
-  const [selected, setSelected] = useState<Network | null>(null)
-  const [filter,   setFilter]   = useState<MapFilter>('all')
-  const [search,   setSearch]   = useState('')
-  const [netOpen,  setNetOpen]  = useState(true)
+interface Attack {
+  id: string
+  label: string
+  desc: string
+  severity: 'critical' | 'high' | 'medium' | 'low'
+  available: boolean
+}
 
-  /* ── derived filter match set ── */
-  const activeDef   = FILTER_DEFS.find((f) => f.key === filter)!
-  const matchBssids = new Set(networks.filter(activeDef.match).map((n) => n.bssid))
-  const hasFilter   = filter !== 'all'
-
-  /* build / update node list */
-  useEffect(() => {
-    const canvas = canvasRef.current
-    if (!canvas) return
-    const W = canvas.offsetWidth
-    const H = canvas.offsetHeight
-
-    nodesRef.current = networks.map(n => {
-      const h = bssidHash(n.bssid)
-      const angle  = ((h % 360) / 360) * Math.PI * 2
-      const radius = 60 + ((h >> 8) % (Math.min(W, H) * 0.38))
-      const cx = W / 2 + Math.cos(angle) * radius
-      const cy = H / 2 + Math.sin(angle) * radius
-      return {
-        network: n,
-        x: cx,
-        y: cy,
-        size: 6 + Math.abs((n.power ?? -80) + 50) * 0.15,
-        pulse: Math.random() * Math.PI * 2,
-      }
-    })
-  }, [networks])
-
-  /* animation loop */
-  useEffect(() => {
-    const canvas = canvasRef.current
-    if (!canvas) return
-    const ctx = canvas.getContext('2d')!
-    let t = 0
-
-    const draw = () => {
-      const W = canvas.width  = canvas.offsetWidth
-      const H = canvas.height = canvas.offsetHeight
-
-      ctx.clearRect(0, 0, W, H)
-
-      /* dot grid */
-      ctx.fillStyle = 'rgba(42,255,138,0.06)'
-      for (let gx = 0; gx < W; gx += 28)
-        for (let gy = 0; gy < H; gy += 28)
-          ctx.fillRect(gx, gy, 1, 1)
-
-      /* scanning sweep */
-      if (scanning) {
-        const sweep = (t * 0.015) % (Math.PI * 2)
-        ctx.save()
-        ctx.translate(W / 2, H / 2)
-        ctx.beginPath()
-        ctx.moveTo(0, 0)
-        ctx.arc(0, 0, Math.max(W, H), sweep, sweep + 0.8)
-        ctx.fillStyle = 'rgba(42,255,138,0.05)'
-        ctx.fill()
-        ctx.restore()
-
-        /* sweep line */
-        ctx.save()
-        ctx.translate(W / 2, H / 2)
-        ctx.beginPath()
-        ctx.moveTo(0, 0)
-        ctx.lineTo(Math.cos(sweep) * Math.max(W, H), Math.sin(sweep) * Math.max(W, H))
-        ctx.strokeStyle = 'rgba(42,255,138,0.4)'
-        ctx.lineWidth = 1
-        ctx.stroke()
-        ctx.restore()
-      }
-
-      /* concentric rings */
-      for (let r = 60; r < Math.max(W, H) * 0.7; r += 70) {
-        ctx.beginPath()
-        ctx.arc(W / 2, H / 2, r, 0, Math.PI * 2)
-        ctx.strokeStyle = 'rgba(42,255,138,0.06)'
-        ctx.lineWidth = 1
-        ctx.stroke()
-      }
-
-      /* centre cross */
-      ctx.strokeStyle = 'rgba(42,255,138,0.15)'
-      ctx.lineWidth = 1
-      ctx.beginPath()
-      ctx.moveTo(W / 2 - 12, H / 2); ctx.lineTo(W / 2 + 12, H / 2)
-      ctx.moveTo(W / 2, H / 2 - 12); ctx.lineTo(W / 2, H / 2 + 12)
-      ctx.stroke()
-
-      /* build per-frame match set from current filter ref */
-      const frameMatchBssids = new Set(
-        nodesRef.current
-          .filter((nd) => FILTER_DEFS.find((f) => f.key === filter)!.match(nd.network))
-          .map((nd) => nd.network.bssid)
-      )
-      const frameHasFilter = filter !== 'all'
-
-      /* connection lines to centre */
-      nodesRef.current.forEach(node => {
-        const dimmed = frameHasFilter && !frameMatchBssids.has(node.network.bssid)
-        ctx.beginPath()
-        ctx.moveTo(W / 2, H / 2)
-        ctx.lineTo(node.x, node.y)
-        ctx.strokeStyle = dimmed ? 'rgba(60,60,60,0.08)' : `${SOFT_GREEN_RGBA}0.10)`
-        ctx.lineWidth = 0.5
-        ctx.stroke()
-      })
-
-      /* nodes */
-      nodesRef.current.forEach(node => {
-        const pulse      = Math.sin(t * 0.04 + node.pulse) * 0.5 + 0.5
-        const r          = node.size
-        const dimmed     = frameHasFilter && !frameMatchBssids.has(node.network.bssid)
-        const isSelected = selected?.bssid === node.network.bssid
-
-        if (dimmed) {
-          /* ── grey, no glow, smaller dot ── */
-          ctx.beginPath()
-          ctx.arc(node.x, node.y, r * 0.65, 0, Math.PI * 2)
-          ctx.fillStyle = 'rgba(55,55,55,0.5)'
-          ctx.fill()
-          ctx.fillStyle = 'rgba(80,80,80,0.35)'
-          ctx.font = '9px monospace'
-          ctx.fillText(node.network.ssid ?? node.network.bssid, node.x + r + 3, node.y + 4)
-          return
-        }
-
-        if (isSelected) {
-          /* ── bright #2aff8a + strong glow — attack target ── */
-          const selC = '#2aff8a'
-
-          /* outer animated ring */
-          ctx.beginPath()
-          ctx.arc(node.x, node.y, r + 12 + pulse * 8, 0, Math.PI * 2)
-          ctx.strokeStyle = `rgba(42,255,138,${(0.12 + pulse * 0.2).toFixed(2)})`
-          ctx.lineWidth = 1.5
-          ctx.stroke()
-
-          /* mid ring */
-          ctx.beginPath()
-          ctx.arc(node.x, node.y, r + 5, 0, Math.PI * 2)
-          ctx.strokeStyle = 'rgba(42,255,138,0.55)'
-          ctx.lineWidth = 1.5
-          ctx.stroke()
-
-          /* core — full bright green with glow */
-          ctx.beginPath()
-          ctx.arc(node.x, node.y, r + 2, 0, Math.PI * 2)
-          ctx.fillStyle = selC
-          ctx.shadowColor = selC
-          ctx.shadowBlur  = 22
-          ctx.fill()
-          ctx.shadowBlur  = 0
-
-          ctx.fillStyle = selC
-          ctx.font = 'bold 9px monospace'
-          ctx.fillText(node.network.ssid ?? node.network.bssid, node.x + r + 6, node.y + 4)
-          return
-        }
-
-        /* ── normal matching node — ALL soft light green ── */
-        /* pulse ring */
-        ctx.beginPath()
-        ctx.arc(node.x, node.y, r + 4 + pulse * 5, 0, Math.PI * 2)
-        ctx.strokeStyle = `${SOFT_GREEN_RGBA}${(pulse * 0.18).toFixed(2)})`
-        ctx.lineWidth = 1
-        ctx.stroke()
-
-        /* dot */
-        ctx.beginPath()
-        ctx.arc(node.x, node.y, r, 0, Math.PI * 2)
-        ctx.fillStyle = `${SOFT_GREEN_RGBA}0.68)`
-        ctx.shadowColor = SOFT_GREEN
-        ctx.shadowBlur  = 5
-        ctx.fill()
-        ctx.shadowBlur  = 0
-
-        /* label */
-        ctx.fillStyle = `${SOFT_GREEN_RGBA}0.55)`
-        ctx.font = '9px monospace'
-        ctx.fillText(node.network.ssid ?? node.network.bssid, node.x + r + 4, node.y + 4)
-      })
-
-      t++
-      frameRef.current = requestAnimationFrame(draw)
-    }
-
-    frameRef.current = requestAnimationFrame(draw)
-    return () => cancelAnimationFrame(frameRef.current)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scanning, filter, selected])
-
-  /* hover hit-test — skip dimmed nodes */
-  const onMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    const rect = canvasRef.current!.getBoundingClientRect()
-    const mx = e.clientX - rect.left
-    const my = e.clientY - rect.top
-    let found: Network | null = null
-    for (const node of nodesRef.current) {
-      if (hasFilter && !matchBssids.has(node.network.bssid)) continue
-      const dx = node.x - mx; const dy = node.y - my
-      if (Math.sqrt(dx * dx + dy * dy) < node.size + 8) { found = node.network; break }
-    }
-    setHovered(found)
-    setTooltip({ x: e.clientX - rect.left + 12, y: e.clientY - rect.top - 8 })
+function possibleAttacks(n: Network): Attack[] {
+  const enc = n.encryption?.toUpperCase() ?? ''
+  const attacks: Attack[] = []
+  if (n.wps_enabled && !n.wps_locked) {
+    attacks.push({ id: 'pixie', label: 'WPS PIXIE-DUST', desc: 'PixieDust offline brute', severity: 'critical', available: true })
+    attacks.push({ id: 'reaver', label: 'WPS BRUTE-FORCE', desc: 'Reaver / Bully PIN attack', severity: 'high', available: true })
   }
-
-  const onClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    const rect = canvasRef.current!.getBoundingClientRect()
-    const mx = e.clientX - rect.left
-    const my = e.clientY - rect.top
-    for (const node of nodesRef.current) {
-      if (hasFilter && !matchBssids.has(node.network.bssid)) continue
-      const dx = node.x - mx; const dy = node.y - my
-      if (Math.sqrt(dx * dx + dy * dy) < node.size + 8) {
-        setSelected(node.network)
-        return
-      }
-    }
-    setSelected(null)
+  if (enc === 'WEP') {
+    attacks.push({ id: 'wep', label: 'WEP CRACK', desc: 'IV collision statistical', severity: 'critical', available: true })
   }
+  if (enc.includes('WPA')) {
+    attacks.push({ id: 'pmkid', label: 'PMKID CAPTURE', desc: 'Hcxdumptool clientless', severity: 'high', available: true })
+    attacks.push({ id: 'hs', label: 'HANDSHAKE DEAUTH', desc: '4-way HS + offline crack', severity: 'high', available: true })
+    attacks.push({ id: 'twin', label: 'EVIL TWIN', desc: 'Rogue AP + phishing portal', severity: 'medium', available: false })
+  }
+  if (!n.encryption || n.encryption === 'OPN') {
+    attacks.push({ id: 'mitm', label: 'OPEN MiTM', desc: 'ARP spoof + intercept', severity: 'critical', available: true })
+  }
+  return attacks
+}
 
-/* ── filtered + searched network list for floating panel ── */
-  const visibleNets = networks
-    .filter(n => !search || (n.ssid ?? n.bssid).toLowerCase().includes(search.toLowerCase()))
-    .sort((a, b) => (b.power ?? -100) - (a.power ?? -100))
+const SEV: Record<string, string> = {
+  critical: '#ff4444', high: '#ff8800', medium: '#ffcc00', low: '#2aff8a',
+}
+
+function simulatedClients(bssid: string): string[] {
+  const h = bssidHash(bssid)
+  const count = (h % 4) + 1
+  return Array.from({ length: count }, (_, i) => {
+    const v = (h ^ (i * 0x9e3779b9)) >>> 0
+    return [0xac, (v >> 24) & 0xff, (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff, i & 0xff]
+      .map(b => b.toString(16).padStart(2, '0')).join(':').toUpperCase()
+  })
+}
+
+const PHASES = [
+  { id: 0, label: 'SCANNING TARGET',       icon: '◎', color: '#2aff8a', dur: 1800 },
+  { id: 1, label: 'DEAUTH FLOOD',          icon: '⚡', color: '#ff8800', dur: 2800 },
+  { id: 2, label: 'CLIENTS DISCONNECTED',  icon: '✕', color: '#ff4444', dur: 1400 },
+  { id: 3, label: 'AWAITING RECONNECT',    icon: '↺', color: '#ffcc00', dur: 2000 },
+  { id: 4, label: 'INTERCEPTING 4-WAY HS', icon: '⬟', color: '#00e5ff', dur: 2600 },
+  { id: 5, label: 'HASH CAPTURED',         icon: '✓', color: '#2aff8a', dur: 9999 },
+]
+
+// ── NetworkDetailPanel ────────────────────────────────────────────────────────
+function NetworkDetailPanel({
+  network, onClose, onStartAttack,
+}: {
+  network: Network
+  onClose: () => void
+  onStartAttack: (n: Network) => void
+}) {
+  const { handshakes, credentials, fetchHandshakes, fetchCredentials } = useCredentialsStore()
+  const [tab, setTab] = useState<'info' | 'attacks' | 'clients'>('info')
+
+  useEffect(() => { fetchHandshakes(); fetchCredentials() }, [fetchHandshakes, fetchCredentials])
+
+  const hs    = handshakes.filter(h => h.bssid.toUpperCase() === network.bssid.toUpperCase())
+  const creds = credentials.filter(c => c.bssid.toUpperCase() === network.bssid.toUpperCase())
+  const clients = simulatedClients(network.bssid)
+  const attacks = possibleAttacks(network)
+  const pct   = signalPct(network.power)
+  const sCol  = signalColor(pct)
+
+  const vulns = [
+    network.wps_enabled && !network.wps_locked && 'WPS_OPEN',
+    network.encryption?.toUpperCase() === 'WEP'  && 'WEP_LEGACY',
+    (!network.encryption || network.encryption === 'OPN') && 'NO_ENCRYPTION',
+  ].filter(Boolean) as string[]
 
   return (
-    <div className="relative w-full h-full">
-
-      {/* ── Filter chip overlay ──────────────────────────────────────────── */}
-      <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1.5 pointer-events-auto">
-        {FILTER_DEFS.map(({ key, label, match }) => {
-          const count  = networks.filter(match).length
-          const active = filter === key
-          return (
-            <button
-              key={key}
-              onClick={() => setFilter(key)}
-              className="flex items-center gap-1.5 px-3 py-1 rounded border transition-all text-[9px] font-bold tracking-widest"
-              style={{
-                borderColor:    active ? 'rgba(42,255,138,0.50)' : 'rgba(42,255,138,0.12)',
-                background:     active ? 'rgba(42,255,138,0.12)' : 'rgba(8,12,16,0.80)',
-                color:          active ? '#2aff8a'                : 'rgba(42,255,138,0.30)',
-                backdropFilter: 'blur(4px)',
-              }}
-            >
-              <span
-                className="w-1.5 h-1.5 rounded-full"
-                style={{ background: active ? '#2aff8a' : 'rgba(42,255,138,0.28)' }}
-              />
-              {label}
-              <span
-                className="tabular-nums ml-0.5"
-                style={{ color: active ? 'rgba(42,255,138,0.65)' : 'rgba(42,255,138,0.20)' }}
-              >
-                {count}
-              </span>
-            </button>
-          )
-        })}
-      </div>
-
-      {/* ── Floating network list (left overlay) ─────────────────────────── */}
-      <div
-        className="absolute top-12 left-3 z-10 pointer-events-auto transition-all"
-        style={{ width: netOpen ? 196 : 36 }}
-      >
-        {/* header row */}
-        <div
-          className="flex items-center gap-1.5 px-2 py-1.5 rounded-t border-x border-t"
-          style={{
-            background:   'rgba(8,12,16,0.92)',
-            borderColor:  'rgba(42,255,138,0.12)',
-            backdropFilter: 'blur(6px)',
-          }}
-        >
-          <button
-            onClick={() => setNetOpen(o => !o)}
-            className="text-[#2aff8a]/30 hover:text-[#2aff8a]/70 transition-colors text-[10px] leading-none shrink-0"
-            title={netOpen ? 'Collapse network list' : 'Expand network list'}
-          >
-            {netOpen ? '◀' : '▶'}
-          </button>
-
-          {netOpen && (
-            <>
-              <span className="text-[8px] text-[#2aff8a]/35 tracking-widest whitespace-nowrap">
-                RF NETWORKS
-              </span>
-              <span className="ml-auto text-[8px] text-[#2aff8a]/20 tabular-nums shrink-0">
-                {networks.length}
-              </span>
-            </>
+    <div className="absolute left-3 top-12 z-20 pointer-events-auto" style={{ width: 264 }}>
+      <div className="rounded-lg overflow-hidden" style={{
+        background: 'rgba(6,10,14,0.88)', border: '1px solid rgba(42,255,138,0.10)',
+        backdropFilter: 'blur(14px)', boxShadow: '0 8px 48px rgba(0,0,0,0.6)',
+      }}>
+        {/* header */}
+        <div className="px-3 pt-3 pb-2" style={{ borderBottom: '1px solid rgba(42,255,138,0.07)' }}>
+          <div className="flex items-start justify-between gap-2">
+            <div className="min-w-0 flex-1">
+              <div className="text-[11px] font-bold text-[#2aff8a] tracking-wide truncate">
+                {network.ssid ?? '(hidden network)'}
+              </div>
+              <div className="text-[9px] text-[#2aff8a]/35 font-mono mt-0.5">{network.bssid}</div>
+            </div>
+            <button onClick={onClose} className="text-[#2aff8a]/20 hover:text-[#2aff8a]/60 text-xs leading-none shrink-0 mt-0.5 transition-colors">✕</button>
+          </div>
+          {/* signal */}
+          <div className="mt-2">
+            <div className="flex justify-between text-[8px] mb-1">
+              <span style={{ color: 'rgba(42,255,138,0.30)' }}>SIGNAL</span>
+              <span style={{ color: sCol }} className="font-mono tabular-nums">{network.power ?? '?'} dBm</span>
+            </div>
+            <div className="h-1 rounded bg-[#0d1f0d] overflow-hidden">
+              <div className="h-full rounded transition-all" style={{ width: `${pct}%`, background: sCol, boxShadow: `0 0 6px ${sCol}` }} />
+            </div>
+          </div>
+          {/* vuln badges */}
+          {vulns.length > 0 && (
+            <div className="flex flex-wrap gap-1 mt-2">
+              {vulns.map(v => (
+                <span key={v} className="text-[7px] px-1.5 py-0.5 rounded font-bold tracking-wider"
+                  style={{ background: 'rgba(255,68,68,0.10)', color: '#ff5555', border: '1px solid rgba(255,68,68,0.18)' }}>
+                  {v}
+                </span>
+              ))}
+            </div>
           )}
-        </div>
-
-        {netOpen && (
-          <>
-            {/* search */}
-            <div
-              className="px-2 py-1.5 border-x"
-              style={{ background: 'rgba(8,12,16,0.92)', borderColor: 'rgba(42,255,138,0.12)', backdropFilter: 'blur(6px)' }}
-            >
-              <input
-                value={search}
-                onChange={e => setSearch(e.target.value)}
-                placeholder="SEARCH…"
-                className="w-full bg-transparent text-[9px] text-[#2aff8a] placeholder:text-[#2aff8a]/20 outline-none font-mono border border-[#2aff8a]/12 rounded px-2 py-0.5 focus:border-[#2aff8a]/35 transition-colors"
-              />
-            </div>
-
-            {/* list */}
-            <div
-              className="overflow-y-auto border-x border-b rounded-b"
-              style={{
-                maxHeight: 240,
-                background:   'rgba(8,12,16,0.92)',
-                borderColor:  'rgba(42,255,138,0.12)',
-                backdropFilter: 'blur(6px)',
-              }}
-            >
-              {visibleNets.length === 0 ? (
-                <div className="text-[9px] text-[#2aff8a]/15 text-center py-4 tracking-widest">
-                  {networks.length === 0 ? 'NO NETWORKS' : 'NO MATCH'}
-                </div>
-              ) : (
-                visibleNets.map(n => {
-                  const pct  = signalPct(n.power)
-                  const isS  = selected?.bssid === n.bssid
-                  return (
-                    <div
-                      key={n.bssid}
-                      onClick={() => setSelected(isS ? null : n)}
-                      className="px-2 py-1.5 cursor-pointer border-b border-[#1a2f1a]/40 last:border-0 transition-colors"
-                      style={{ background: isS ? 'rgba(42,255,138,0.06)' : 'transparent' }}
-                      onMouseEnter={e => (e.currentTarget.style.background = 'rgba(42,255,138,0.04)')}
-                      onMouseLeave={e => (e.currentTarget.style.background = isS ? 'rgba(42,255,138,0.06)' : 'transparent')}
-                    >
-                      <div className="flex items-center gap-1.5 mb-0.5">
-                        <span className="text-[9px] text-[#2aff8a]/75 font-mono truncate flex-1">
-                          {n.ssid ?? '(hidden)'}
-                        </span>
-                        <span className="text-[8px] text-[#2aff8a]/30 shrink-0 tabular-nums">
-                          {n.power ?? '?'}<span className="text-[7px]">dBm</span>
-                        </span>
-                      </div>
-                      {/* signal bar */}
-                      <div className="h-px bg-[#1a2f1a] rounded overflow-hidden">
-                        <div
-                          className="h-full rounded transition-all"
-                          style={{
-                            width: `${pct}%`,
-                            background: pct > 60 ? 'rgba(42,255,138,0.7)' : pct > 30 ? 'rgba(42,255,138,0.45)' : 'rgba(42,255,138,0.25)',
-                          }}
-                        />
-                      </div>
-                      <div className="flex items-center gap-1 mt-0.5">
-                        <span className="text-[7px] text-[#2aff8a]/20 font-mono truncate">CH{n.channel ?? '?'}</span>
-                        <span className="text-[7px] text-[#2aff8a]/20">·</span>
-                        <span className="text-[7px] text-[#2aff8a]/25 font-mono">{encLabel(n.encryption)}</span>
-                        {n.wps_enabled && !n.wps_locked && (
-                          <span className="text-[7px] text-[#2aff8a]/40 ml-auto">WPS</span>
-                        )}
-                      </div>
-                    </div>
-                  )
-                })
-              )}
-            </div>
-          </>
-        )}
-      </div>
-
-      <canvas
-        ref={canvasRef}
-        className="w-full h-full"
-        style={{ cursor: hovered ? 'pointer' : 'crosshair' }}
-        onMouseMove={onMouseMove}
-        onMouseLeave={() => setHovered(null)}
-        onClick={onClick}
-      />
-
-      {/* empty state */}
-      {networks.length === 0 && (
-        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-          <div className="text-center text-[#2aff8a]/20 text-xs tracking-widest">
-            <div className="text-2xl mb-2">◎</div>
-            <div>NO NETWORKS DETECTED</div>
-            <div className="mt-1">INITIATE SCAN TO POPULATE MAP</div>
-          </div>
-        </div>
-      )}
-
-      {/* hover tooltip */}
-      {hovered && (
-        <div
-          className="absolute pointer-events-none z-20 bg-[#0a1a0a]/95 border border-[#2aff8a]/30 rounded p-2 text-[10px] min-w-[160px]"
-          style={{ left: tooltip.x, top: tooltip.y }}
-        >
-          <div className="text-[#2aff8a] font-bold">{hovered.ssid ?? '(hidden)'}</div>
-          <div className="text-[#2aff8a]/60 mt-0.5">{hovered.bssid}</div>
-          <div className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5 text-[#2aff8a]/50">
-            <span>CH {hovered.channel ?? '?'}</span>
-            <span>{encLabel(hovered.encryption)}</span>
-            <span>{hovered.power ?? '?'} dBm</span>
-            {hovered.wps_enabled && <span className="text-[#2aff8a]/70">WPS</span>}
-          </div>
-        </div>
-      )}
-
-      {/* selected node panel */}
-      {selected && (
-        <div
-          className="absolute bottom-4 right-4 bg-[#0a1a0a]/95 border border-[#2aff8a]/40 rounded p-3 text-[11px] w-60 z-20"
-          style={{ boxShadow: '0 0 24px rgba(42,255,138,0.10)' }}
-        >
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-[#2aff8a]/80 font-bold tracking-wider text-[10px]">TARGET SELECTED</span>
-            <button onClick={() => setSelected(null)} className="text-[#2aff8a]/30 hover:text-[#2aff8a] text-xs">✕</button>
-          </div>
-          <div className="text-[#2aff8a] font-bold mb-0.5">{selected.ssid ?? '(hidden)'}</div>
-          <div className="text-[#2aff8a]/40 text-[10px] mb-2 font-mono">{selected.bssid}</div>
-          <div className="grid grid-cols-3 gap-1 text-[10px] mb-3">
-            {([
-              ['CH',     selected.channel ?? '?'],
-              ['ENC',    selected.encryption ?? 'OPEN'],
-              ['PWR',    `${selected.power ?? '?'}dBm`],
-              ['WPS',    selected.wps_enabled ? (selected.wps_locked ? 'LOCKED' : 'OPEN') : 'N/A'],
-              ['CIPHER', selected.cipher ?? '?'],
-              ['AUTH',   selected.auth ?? '?'],
-            ] as [string, string | number][]).map(([k, v]) => (
-              <div key={k} className="bg-[#0d1f0d]/80 rounded p-1">
-                <div className="text-[#2aff8a]/30 text-[8px]">{k}</div>
-                <div className="text-[#2aff8a]/85 font-bold text-[9px]">{String(v)}</div>
+          {/* hash / cred status */}
+          <div className="flex gap-1.5 mt-2">
+            {[
+              { label: `HASH ${hs.length ? `(${hs.length})` : 'NONE'}`, present: hs.length > 0, c: '#00e5ff' },
+              { label: `CRED ${creds.length ? `(${creds.length})` : 'NONE'}`, present: creds.length > 0, c: SG },
+            ].map(({ label, present, c }) => (
+              <div key={label} className="flex items-center gap-1 px-1.5 py-0.5 rounded" style={{
+                background: present ? `${c}0d` : 'rgba(255,255,255,0.02)',
+                border: `1px solid ${present ? c + '22' : 'rgba(255,255,255,0.04)'}`,
+              }}>
+                <span style={{ color: present ? c : 'rgba(255,255,255,0.18)' }} className="text-[8px]">{present ? '◈' : '○'}</span>
+                <span style={{ color: present ? c : 'rgba(255,255,255,0.22)' }} className="text-[7px] font-mono">{label}</span>
               </div>
             ))}
           </div>
+        </div>
+
+        {/* tabs */}
+        <div className="flex" style={{ borderBottom: '1px solid rgba(42,255,138,0.07)' }}>
+          {(['info','attacks','clients'] as const).map(t => (
+            <button key={t} onClick={() => setTab(t)} className="flex-1 py-1.5 text-[8px] tracking-widest font-bold transition-all" style={{
+              color: tab === t ? SG : 'rgba(42,255,138,0.28)',
+              background: tab === t ? 'rgba(42,255,138,0.06)' : 'transparent',
+              borderBottom: tab === t ? `1px solid ${SG}` : '1px solid transparent',
+            }}>
+              {t.toUpperCase()}
+            </button>
+          ))}
+        </div>
+
+        {/* tab body */}
+        <div className="p-3 text-[9px]">
+          {tab === 'info' && (
+            <div className="space-y-1.5">
+              {([
+                ['SSID',    network.ssid ?? '(hidden)'],
+                ['BSSID',   network.bssid],
+                ['CHANNEL', network.channel ?? '?'],
+                ['ENCRYPT', encLabel(network.encryption)],
+                ['CIPHER',  network.cipher ?? '?'],
+                ['AUTH',    network.auth ?? '?'],
+                ['WPS',     network.wps_enabled ? (network.wps_locked ? 'LOCKED' : '⚠ OPEN') : 'DISABLED'],
+                ['VENDOR',  network.vendor ?? 'UNKNOWN'],
+              ] as [string, string|number][]).map(([k, v]) => (
+                <div key={k} className="flex items-baseline gap-2">
+                  <span className="w-14 shrink-0 tracking-wider" style={{ color: 'rgba(42,255,138,0.25)' }}>{k}</span>
+                  <span className="font-mono truncate" style={{ color: k === 'WPS' && String(v).includes('⚠') ? '#ff8800' : 'rgba(42,255,138,0.72)' }}>{String(v)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {tab === 'attacks' && (
+            <div className="space-y-1.5">
+              {attacks.length === 0 && <div className="text-center py-4" style={{ color: 'rgba(42,255,138,0.15)' }}>NO VECTORS IDENTIFIED</div>}
+              {attacks.map(a => (
+                <div key={a.id} className="rounded px-2 py-1.5" style={{
+                  background: a.available ? `${SEV[a.severity]}0a` : 'rgba(255,255,255,0.02)',
+                  border: `1px solid ${a.available ? SEV[a.severity] + '20' : 'rgba(255,255,255,0.04)'}`,
+                  opacity: a.available ? 1 : 0.4,
+                }}>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-bold tracking-wider text-[8px]" style={{ color: SEV[a.severity] }}>{a.label}</span>
+                    <span className="text-[7px] px-1 rounded" style={{ color: SEV[a.severity], background: `${SEV[a.severity]}15` }}>{a.severity.toUpperCase()}</span>
+                  </div>
+                  <div className="mt-0.5" style={{ color: 'rgba(42,255,138,0.28)' }}>{a.desc}</div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {tab === 'clients' && (
+            <div className="space-y-1.5">
+              <div className="tracking-widest mb-2" style={{ color: 'rgba(42,255,138,0.22)' }}>EST. CLIENTS: {clients.length}</div>
+              {clients.map((mac, i) => (
+                <div key={mac} className="flex items-center gap-2 rounded px-2 py-1" style={{ background: 'rgba(42,255,138,0.03)', border: '1px solid rgba(42,255,138,0.06)' }}>
+                  <span style={{ color: 'rgba(42,255,138,0.28)' }} className="text-[8px]">CLI_{i+1}</span>
+                  <span className="font-mono text-[8px] truncate" style={{ color: 'rgba(42,255,138,0.55)' }}>{mac}</span>
+                  <span className="ml-auto text-[7px]" style={{ color: SG, opacity: 0.5 }}>●</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* CTA */}
+        <div className="px-3 pb-3">
           <button
-            onClick={() => { onAttack(selected); setSelected(null) }}
-            className="w-full text-[10px] tracking-widest py-1.5 rounded font-bold transition-all"
-            style={{
-              background:   'rgba(42,255,138,0.08)',
-              border:       '1px solid rgba(42,255,138,0.35)',
-              color:        'rgba(42,255,138,0.85)',
-            }}
-            onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(42,255,138,0.18)' }}
-            onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(42,255,138,0.08)' }}
+            onClick={() => onStartAttack(network)}
+            className="w-full py-2 rounded font-bold text-[10px] tracking-widest transition-all"
+            style={{ background: 'rgba(255,68,68,0.08)', border: '1px solid rgba(255,68,68,0.22)', color: 'rgba(255,110,110,0.90)' }}
+            onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,68,68,0.16)'; (e.currentTarget as HTMLButtonElement).style.borderColor = 'rgba(255,68,68,0.45)' }}
+            onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,68,68,0.08)'; (e.currentTarget as HTMLButtonElement).style.borderColor = 'rgba(255,68,68,0.22)' }}
           >
             ⚡ INITIATE ATTACK
           </button>
         </div>
+      </div>
+    </div>
+  )
+}
+
+// ── AttackAnimation ───────────────────────────────────────────────────────────
+function AttackAnimation({ network, onFinish, onHandoff }: {
+  network: Network; onFinish: () => void; onHandoff: (n: Network) => void
+}) {
+  const [phase, setPhase]         = useState(0)
+  const [pkts,  setPkts]          = useState<{ id: number; x: number; y: number; tx: number; ty: number; p: number; type: 'deauth'|'hs' }[]>([])
+  const [gone,  setGone]          = useState<number[]>([])
+  const pktId   = useRef(0)
+  const clients = simulatedClients(network.bssid).slice(0, 4)
+
+  useEffect(() => {
+    if (phase >= PHASES.length - 1) return
+    const t = setTimeout(() => setPhase(p => p + 1), PHASES[phase].dur)
+    return () => clearTimeout(t)
+  }, [phase])
+
+  useEffect(() => {
+    let iv: ReturnType<typeof setInterval>
+    if (phase === 1) {
+      let i = 0
+      iv = setInterval(() => {
+        const cx = 10 + (i % clients.length) * 52
+        setPkts(prev => [...prev.slice(-24), { id: pktId.current++, x: 100, y: 135, tx: cx + 10, ty: 72, p: 0, type: 'deauth' }])
+        i++
+      }, 250)
+    }
+    if (phase === 4) {
+      let i = 0
+      iv = setInterval(() => {
+        const cx = 10 + (i % clients.length) * 52
+        setPkts(prev => [...prev.slice(-24), { id: pktId.current++, x: cx + 10, y: 72, tx: 88, ty: 18, p: 0, type: 'hs' }])
+        i++
+      }, 350)
+    }
+    return () => clearInterval(iv)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase])
+
+  useEffect(() => {
+    const raf = { current: 0 }
+    const tick = () => {
+      setPkts(prev => prev.map(p => ({ ...p, p: Math.min(1, p.p + 0.04) })).filter(p => p.p < 1))
+      raf.current = requestAnimationFrame(tick)
+    }
+    raf.current = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(raf.current)
+  }, [])
+
+  useEffect(() => {
+    if (phase === 2) {
+      clients.forEach((_, i) => setTimeout(() => setGone(prev => [...prev, i]), i * 300))
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase])
+
+  const cur = PHASES[phase]
+
+  // AP position: 88,18  clients: 10+i*52, 72  attacker: 100,135
+  const clientPositions = clients.map((_, i) => ({ cx: 10 + i * 52, cy: 72 }))
+
+  return (
+    <div className="absolute inset-0 z-30 flex flex-col" style={{ background: 'rgba(3,6,10,0.97)', backdropFilter: 'blur(10px)' }}>
+
+      <button onClick={onFinish} className="absolute top-3 right-4 z-10 text-xs transition-colors" style={{ color: 'rgba(42,255,138,0.22)' }}
+        onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(42,255,138,0.70)')}
+        onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(42,255,138,0.22)')}>
+        ESC ✕
+      </button>
+
+      {/* phase header */}
+      <div className="flex flex-col items-center pt-5 pb-2 shrink-0">
+        <span className="text-3xl mb-1.5 transition-all" style={{ color: cur.color, filter: `drop-shadow(0 0 14px ${cur.color})` }}>{cur.icon}</span>
+        <span className="text-[11px] font-bold tracking-[0.3em]" style={{ color: cur.color }}>{cur.label}</span>
+        <span className="text-[9px] font-mono mt-1" style={{ color: 'rgba(42,255,138,0.22)' }}>{network.ssid ?? network.bssid}</span>
+      </div>
+
+      {/* progress dots */}
+      <div className="flex justify-center gap-1.5 mb-3 shrink-0">
+        {PHASES.map((p, i) => (
+          <div key={p.id} className="rounded-full transition-all" style={{
+            width: i <= phase ? 18 : 6, height: 6,
+            background: i < phase ? SG : i === phase ? cur.color : 'rgba(255,255,255,0.07)',
+          }} />
+        ))}
+      </div>
+
+      {/* topology SVG */}
+      <div className="flex-1 relative mx-4 overflow-hidden">
+        <svg className="w-full h-full" viewBox="0 0 220 180" preserveAspectRatio="xMidYMid meet">
+
+          {/* AP icon */}
+          <g transform="translate(88,18)">
+            <rect x="-18" y="-4" width="36" height="32" rx="4" fill="rgba(42,255,138,0.05)" stroke="rgba(42,255,138,0.12)" strokeWidth="0.6"/>
+            {/* Cisco AP symbol */}
+            <circle cx="0" cy="10" r="6" fill="none" stroke={SG} strokeWidth="1.2" opacity="0.8"/>
+            <circle cx="0" cy="10" r="3" fill={SG} opacity="0.7"/>
+            <path d="M-10,6 Q-10,-2 0,-2 Q10,-2 10,6" fill="none" stroke={SG} strokeWidth="1" opacity="0.5"/>
+            <path d="M-15,4 Q-15,-6 0,-6 Q15,-6 15,4" fill="none" stroke={SG} strokeWidth="0.7" opacity="0.3"/>
+            <line x1="0" y1="16" x2="0" y2="28" stroke={SG} strokeWidth="1.5" opacity="0.6"/>
+            <text x="0" y="36" textAnchor="middle" fontSize="5" fill="rgba(42,255,138,0.40)" fontFamily="monospace">ACCESS-POINT</text>
+            <text x="0" y="42" textAnchor="middle" fontSize="4.5" fill="rgba(42,255,138,0.25)" fontFamily="monospace">{network.ssid?.slice(0,12) ?? network.bssid.slice(-11)}</text>
+          </g>
+
+          {/* Client icons */}
+          {clientPositions.map(({ cx, cy }, i) => {
+            const isGone = gone.includes(i)
+            return (
+              <g key={i} transform={`translate(${cx},${cy})`} style={{ opacity: isGone ? 0.15 : 1, transition: 'opacity 0.5s' }}>
+                <rect x="-14" y="-12" width="28" height="22" rx="3" fill="rgba(42,255,138,0.04)" stroke="rgba(42,255,138,0.09)" strokeWidth="0.6"/>
+                {/* Cisco workstation */}
+                <rect x="-8" y="-9" width="16" height="11" rx="1.5" fill="none" stroke={isGone ? '#ff4444' : SG} strokeWidth="1" opacity="0.75"/>
+                <rect x="-6" y="-7" width="12" height="7" rx="0.5" fill={isGone ? 'rgba(255,68,68,0.08)' : 'rgba(42,255,138,0.06)'}/>
+                <line x1="-4" y1="2" x2="-5" y2="6" stroke={isGone ? '#ff4444' : SG} strokeWidth="1" opacity="0.5"/>
+                <line x1="4" y1="2" x2="5" y2="6" stroke={isGone ? '#ff4444' : SG} strokeWidth="1" opacity="0.5"/>
+                <line x1="-6" y1="6" x2="6" y2="6" stroke={isGone ? '#ff4444' : SG} strokeWidth="1" opacity="0.5"/>
+                <text x="0" y="14" textAnchor="middle" fontSize="4.5" fill={isGone ? 'rgba(255,68,68,0.4)' : 'rgba(42,255,138,0.30)'} fontFamily="monospace">CLI_{i+1}</text>
+                {isGone && <text x="0" y="-16" textAnchor="middle" fontSize="10" fill="#ff4444" opacity="0.9">✕</text>}
+                {/* line to AP */}
+                <line x1="0" y1="-12" x2={88-cx} y2={18-cy+4}
+                  stroke={isGone ? 'rgba(255,68,68,0.12)' : 'rgba(42,255,138,0.10)'} strokeWidth="0.5" strokeDasharray="3,3"/>
+              </g>
+            )
+          })}
+
+          {/* Attacker icon */}
+          <g transform="translate(100,140)">
+            <rect x="-16" y="-14" width="32" height="26" rx="3" fill="rgba(255,68,68,0.06)" stroke="rgba(255,68,68,0.16)" strokeWidth="0.6"/>
+            {/* Cisco threat actor / antenna symbol */}
+            <polygon points="0,-10 10,8 -10,8" fill="none" stroke="#ff4444" strokeWidth="1.2" opacity="0.85"/>
+            <line x1="0" y1="-10" x2="0" y2="-2" stroke="#ff4444" strokeWidth="1.5" opacity="0.7"/>
+            <circle cx="0" cy="-12" r="2" fill="#ff4444" opacity="0.7"/>
+            {/* wifi waves emanating */}
+            <path d="M-8,-18 Q0,-22 8,-18" fill="none" stroke="#ff4444" strokeWidth="0.8" opacity="0.5"/>
+            <path d="M-12,-22 Q0,-28 12,-22" fill="none" stroke="#ff4444" strokeWidth="0.6" opacity="0.3"/>
+            <text x="0" y="18" textAnchor="middle" fontSize="4.5" fill="rgba(255,68,68,0.45)" fontFamily="monospace">ATTACKER</text>
+          </g>
+
+          {/* attack line attacker → AP (phase ≥4) */}
+          {phase >= 4 && (
+            <line x1="100" y1="126" x2="88" y2="50"
+              stroke="#00e5ff" strokeWidth="1.2" strokeDasharray="5,3" opacity="0.45"/>
+          )}
+
+          {/* animated packets */}
+          {pkts.map(pk => {
+            const px = pk.x + (pk.tx - pk.x) * pk.p
+            const py = pk.y + (pk.ty - pk.y) * pk.p
+            const c = pk.type === 'deauth' ? '#ff8800' : '#00e5ff'
+            return (
+              <g key={pk.id} transform={`translate(${px},${py})`}>
+                <circle r="3" fill={c} opacity={0.9 - pk.p * 0.6} style={{ filter: `drop-shadow(0 0 3px ${c})` }}/>
+                <text y="1.2" textAnchor="middle" fontSize="4" fill={c} opacity={0.9 - pk.p * 0.6} fontFamily="monospace">
+                  {pk.type === 'deauth' ? 'D' : 'H'}
+                </text>
+              </g>
+            )
+          })}
+        </svg>
+      </div>
+
+      {/* log */}
+      <div className="mx-4 mb-2 rounded px-3 py-2 font-mono text-[8px] leading-relaxed shrink-0" style={{
+        background: 'rgba(0,0,0,0.35)', border: '1px solid rgba(42,255,138,0.06)', maxHeight: 68, overflow: 'hidden',
+      }}>
+        {PHASES.slice(0, phase + 1).map((p, i) => (
+          <div key={p.id} style={{ color: i === phase ? p.color : 'rgba(42,255,138,0.28)' }}>
+            <span style={{ opacity: 0.35 }}>[{String(i).padStart(2,'0')}] </span>
+            {p.label}
+            {i < phase && <span style={{ color: SG }}> ✓</span>}
+            {i === phase && <span className="animate-pulse"> ▮</span>}
+          </div>
+        ))}
+      </div>
+
+      {/* success actions */}
+      {phase === PHASES.length - 1 && (
+        <div className="mx-4 mb-4 flex gap-2 shrink-0">
+          <button onClick={() => { onHandoff(network); onFinish() }}
+            className="flex-1 py-2 rounded font-bold text-[10px] tracking-widest transition-all"
+            style={{ background: 'rgba(42,255,138,0.09)', border: `1px solid ${SG}50`, color: SG }}
+            onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.background = 'rgba(42,255,138,0.18)')}
+            onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.background = 'rgba(42,255,138,0.09)')}>
+            → OPEN CONSOLE
+          </button>
+          <button onClick={onFinish}
+            className="px-4 py-2 rounded text-[10px] tracking-widest transition-all"
+            style={{ border: '1px solid rgba(42,255,138,0.12)', color: 'rgba(42,255,138,0.38)' }}>
+            CLOSE
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── RFNetworkPanel (right side) ───────────────────────────────────────────────
+function RFNetworkPanel({ networks, selected, onSelect, search, onSearch, open, onToggle }: {
+  networks: Network[]; selected: Network | null; onSelect: (n: Network | null) => void
+  search: string; onSearch: (v: string) => void; open: boolean; onToggle: () => void
+}) {
+  const { handshakes, credentials, fetchHandshakes, fetchCredentials } = useCredentialsStore()
+  useEffect(() => { fetchHandshakes(); fetchCredentials() }, [fetchHandshakes, fetchCredentials])
+
+  // quick lookup: bssid → counts
+  const hsMap   = new Map<string, number>()
+  const credMap = new Map<string, number>()
+  handshakes.forEach(h  => { const k = h.bssid.toUpperCase();  hsMap.set(k, (hsMap.get(k)  ?? 0) + 1) })
+  credentials.forEach(c => { const k = c.bssid.toUpperCase(); credMap.set(k, (credMap.get(k) ?? 0) + 1) })
+
+  const visible = networks
+    .filter(n => !search || (n.ssid ?? n.bssid).toLowerCase().includes(search.toLowerCase()))
+    .sort((a, b) => (b.power ?? -100) - (a.power ?? -100))
+
+  return (
+    <div className="absolute top-10 right-3 z-10 pointer-events-auto transition-all duration-200" style={{ width: open ? 308 : 36 }}>
+      {/* header */}
+      <div className="flex items-center gap-2 px-2.5 py-2 rounded-t" style={{
+        background: 'rgba(4,7,11,0.94)',
+        border: '1px solid rgba(42,255,138,0.12)',
+        backdropFilter: 'blur(22px)',
+        boxShadow: '0 4px 32px rgba(0,0,0,0.55)',
+      }}>
+        <button onClick={onToggle} className="text-[10px] leading-none shrink-0 transition-colors" style={{ color: 'rgba(42,255,138,0.30)' }}
+          onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(42,255,138,0.75)')}
+          onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(42,255,138,0.30)')}>
+          {open ? '▶' : '◀'}
+        </button>
+        {open && <>
+          <span className="text-[9px] tracking-[0.25em] whitespace-nowrap flex-1 font-bold" style={{ color: 'rgba(42,255,138,0.60)' }}>RF_NETWORKS</span>
+          <span className="text-[8px] tabular-nums shrink-0 px-1.5 py-0.5 rounded font-mono" style={{
+            color: 'rgba(42,255,138,0.75)',
+            background: 'rgba(42,255,138,0.08)',
+            border: '1px solid rgba(42,255,138,0.14)',
+          }}>{networks.length}</span>
+        </>}
+      </div>
+
+      {open && <>
+        {/* search */}
+        <div className="px-2.5 py-2" style={{
+          background: 'rgba(4,7,11,0.93)',
+          borderLeft: '1px solid rgba(42,255,138,0.12)',
+          borderRight: '1px solid rgba(42,255,138,0.12)',
+          backdropFilter: 'blur(22px)',
+        }}>
+          <div className="flex items-center gap-2 rounded-md px-2.5 py-1.5 transition-all" style={{
+            border: `1px solid ${search ? 'rgba(42,255,138,0.28)' : 'rgba(42,255,138,0.10)'}`,
+            background: 'rgba(0,0,0,0.40)',
+            boxShadow: search ? '0 0 10px rgba(42,255,138,0.08), inset 0 0 8px rgba(42,255,138,0.03)' : 'none',
+          }}>
+            <span className="text-[11px] shrink-0" style={{ color: search ? 'rgba(42,255,138,0.75)' : 'rgba(42,255,138,0.28)' }}>⌕</span>
+            <input
+              value={search}
+              onChange={e => onSearch(e.target.value)}
+              placeholder="FILTER NETWORKS…"
+              className="w-full bg-transparent text-[10px] text-[#2aff8a] placeholder:text-[#2aff8a]/18 outline-none font-mono tracking-wide"
+            />
+            {search && (
+              <button onClick={() => onSearch('')} className="text-[11px] shrink-0 px-0.5 rounded transition-colors"
+                style={{ color: 'rgba(42,255,138,0.45)' }}
+                onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(42,255,138,0.90)')}
+                onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(42,255,138,0.45)')}>×</button>
+            )}
+          </div>
+          {search && (
+            <div className="mt-1.5 flex items-center gap-1.5" style={{ fontSize: 8, color: 'rgba(42,255,138,0.38)' }}>
+              <span className="tracking-widest">{visible.length} MATCH{visible.length !== 1 ? 'ES' : ''}</span>
+              <span style={{ opacity: 0.5 }}>·</span>
+              <span style={{ color: 'rgba(42,255,138,0.55)' }}>RADAR FILTERED</span>
+            </div>
+          )}
+        </div>
+
+        {/* list */}
+        <div className="overflow-y-auto rounded-b" style={{
+          maxHeight: 'calc(100vh - 172px)',
+          background: 'rgba(4,7,11,0.92)',
+          border: '1px solid rgba(42,255,138,0.12)', borderTop: 'none',
+          backdropFilter: 'blur(22px)',
+          boxShadow: '0 8px 40px rgba(0,0,0,0.60)',
+        }}>
+          {visible.length === 0 ? (
+            <div className="text-center py-8 tracking-widest" style={{ fontSize: 9, color: 'rgba(42,255,138,0.14)' }}>
+              {networks.length === 0 ? 'NO NETWORKS DETECTED' : 'NO MATCH'}
+            </div>
+          ) : visible.map(n => {
+            const pct      = signalPct(n.power)
+            const sCol     = signalColor(pct)
+            const isS      = selected?.bssid === n.bssid
+            const vuln     = isVulnerable(n)
+            const bssidUp  = n.bssid.toUpperCase()
+            const hsCount  = hsMap.get(bssidUp)   ?? 0
+            const credCount = credMap.get(bssidUp) ?? 0
+            return (
+              <div key={n.bssid} onClick={() => onSelect(isS ? null : n)}
+                className="px-3 py-2.5 cursor-pointer transition-all"
+                style={{
+                  background:   isS ? 'rgba(42,255,138,0.07)' : 'transparent',
+                  borderBottom: '1px solid rgba(42,255,138,0.05)',
+                  borderLeft:   isS ? `2px solid ${SG}` : '2px solid transparent',
+                }}
+                onMouseEnter={e => { if (!isS) e.currentTarget.style.background = 'rgba(42,255,138,0.04)' }}
+                onMouseLeave={e => { if (!isS) e.currentTarget.style.background = 'transparent' }}
+              >
+                {/* row 1 – signal dot + SSID + vuln */}
+                <div className="flex items-center gap-2 mb-1.5">
+                  <span className="w-2 h-2 rounded-full shrink-0" style={{ background: sCol, boxShadow: `0 0 6px ${sCol}` }} />
+                  <span className="text-[10px] font-mono font-bold truncate flex-1" style={{ color: isS ? SG : 'rgba(42,255,138,0.80)' }}>
+                    {n.ssid ?? '(hidden)'}
+                  </span>
+                  {vuln && (
+                    <span className="text-[8px] px-1.5 py-0.5 rounded shrink-0 font-bold"
+                      style={{ color: '#ff5555', background: 'rgba(255,68,68,0.10)', border: '1px solid rgba(255,68,68,0.20)' }}>⚠</span>
+                  )}
+                </div>
+
+                {/* row 2 – signal bar */}
+                <div className="h-1 rounded-full overflow-hidden mb-1.5" style={{ background: 'rgba(42,255,138,0.07)' }}>
+                  <div className="h-full rounded-full transition-all" style={{ width: `${pct}%`, background: sCol, boxShadow: `0 0 6px ${sCol}70` }} />
+                </div>
+
+                {/* row 3 – meta info */}
+                <div className="flex items-center gap-1.5 mb-2" style={{ fontSize: 8, color: 'rgba(42,255,138,0.35)' }}>
+                  <span className="font-mono tabular-nums font-semibold" style={{ color: sCol }}>{n.power ?? '?'} dBm</span>
+                  <span style={{ opacity: 0.4 }}>·</span>
+                  <span>CH {n.channel ?? '?'}</span>
+                  <span style={{ opacity: 0.4 }}>·</span>
+                  <span>{encLabel(n.encryption)}</span>
+                  {n.wps_enabled && !n.wps_locked && (
+                    <span className="ml-auto font-bold tracking-wider" style={{ color: '#ff8800' }}>WPS!</span>
+                  )}
+                </div>
+
+                {/* row 4 – HS / KEY status badges */}
+                <div className="flex items-center gap-1.5">
+                  <div className="flex items-center gap-1 px-1.5 py-0.5 rounded" style={{
+                    background: hsCount > 0 ? 'rgba(0,229,255,0.08)' : 'rgba(255,255,255,0.02)',
+                    border: `1px solid ${hsCount > 0 ? 'rgba(0,229,255,0.22)' : 'rgba(255,255,255,0.05)'}`,
+                  }}>
+                    <span style={{ color: hsCount > 0 ? '#00e5ff' : 'rgba(255,255,255,0.18)', fontSize: 9 }}>
+                      {hsCount > 0 ? '◈' : '○'}
+                    </span>
+                    <span className="font-mono" style={{ fontSize: 7, color: hsCount > 0 ? '#00e5ff' : 'rgba(255,255,255,0.22)' }}>
+                      HS{hsCount > 0 ? ` ×${hsCount}` : ''}
+                    </span>
+                  </div>
+
+                  <div className="flex items-center gap-1 px-1.5 py-0.5 rounded" style={{
+                    background: credCount > 0 ? 'rgba(42,255,138,0.09)' : 'rgba(255,255,255,0.02)',
+                    border: `1px solid ${credCount > 0 ? 'rgba(42,255,138,0.22)' : 'rgba(255,255,255,0.05)'}`,
+                  }}>
+                    <span style={{ color: credCount > 0 ? SG : 'rgba(255,255,255,0.18)', fontSize: 9 }}>
+                      {credCount > 0 ? '◈' : '○'}
+                    </span>
+                    <span className="font-mono" style={{ fontSize: 7, color: credCount > 0 ? SG : 'rgba(255,255,255,0.22)' }}>
+                      {credCount > 0 ? `KEY ×${credCount}` : 'NO KEY'}
+                    </span>
+                  </div>
+
+                  {/* BSSID tail */}
+                  <span className="ml-auto font-mono" style={{ fontSize: 7, color: 'rgba(42,255,138,0.18)' }}>
+                    {n.bssid.slice(-8)}
+                  </span>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </>}
+    </div>
+  )
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+export function NetworkMap({ networks, scanning, onAttack, onStart, onStop, filter }: Props) {
+  const canvasRef   = useRef<HTMLCanvasElement>(null)
+  const nodesRef    = useRef<MapNode[]>([])
+  const frameRef    = useRef(0)
+  const pendingRef  = useRef<MapNode[]>([])   // stagger queue
+  const lastPopRef  = useRef(0)               // frame of last pop
+
+  const [hovered,    setHovered]    = useState<Network | null>(null)
+  const [tooltip,    setTooltip]    = useState({ x: 0, y: 0 })
+  const [selected,   setSelected]   = useState<Network | null>(null)
+  const [search,     setSearch]     = useState('')
+  const [netOpen,    setNetOpen]    = useState(true)
+  const [attacking,  setAttacking]  = useState<Network | null>(null)
+  const [hasScanned, setHasScanned] = useState(false)
+  const lastDimRef   = useRef({ w: 0, h: 0 })  // persist canvas dimensions across effect restarts
+  const searchRef    = useRef('')
+  useEffect(() => { searchRef.current = search }, [search])
+
+  useEffect(() => { if (scanning) setHasScanned(true) }, [scanning])
+
+  const activeDef   = FILTER_DEFS.find(f => f.key === filter)!
+  const matchBssids = new Set(networks.filter(activeDef.match).map(n => n.bssid))
+  const hasFilter   = filter !== 'all'
+
+  const placeNode = useCallback((n: Network): MapNode => {
+    const canvas = canvasRef.current
+    const W = (canvas && canvas.offsetWidth  > 0) ? canvas.offsetWidth  : 900
+    const H = (canvas && canvas.offsetHeight > 0) ? canvas.offsetHeight : 600
+
+    const h = bssidHash(n.bssid)
+
+    // Two independent 16-bit slices → independent X and Y in [0, 1)
+    const tx = (h & 0xffff) / 0x10000
+    const ty = ((h >>> 16) & 0xffff) / 0x10000
+
+    // Spread across the full rectangular canvas with margin to keep labels readable
+    const mx = 56, my = 44
+    let x = mx + tx * (W - mx * 2)
+    let y = my + ty * (H - my * 2)
+
+    // Push nodes out of the center button's dead zone (radius 68px)
+    const cx = W / 2, cy = H / 2
+    const dx = x - cx, dy = y - cy
+    const dist = Math.sqrt(dx * dx + dy * dy)
+    const dead = 68
+    if (dist < dead) {
+      // Radially push to the dead zone boundary, preserving direction
+      const s = dist > 0 ? dead / dist : 1
+      x = cx + dx * s
+      y = cy + dy * s
+    }
+
+    return {
+      network: n,
+      x,
+      y,
+      size: 7 + Math.abs((n.power ?? -80) + 50) * 0.18,
+      pulse: Math.random() * Math.PI * 2,
+      enterT: 0,
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    const existingBssids = new Set(nodesRef.current.map(nd => nd.network.bssid))
+
+    // update existing nodes' live data (power, wps flags, etc.)
+    nodesRef.current = nodesRef.current.map(nd => {
+      const fresh = networks.find(n => n.bssid === nd.network.bssid)
+      return fresh ? { ...nd, network: fresh } : nd
+    })
+
+    // append brand-new nodes — they enter with enterT=0 (animated in draw loop)
+    const newNodes = networks
+      .filter(n => !existingBssids.has(n.bssid))
+      .map(placeNode)
+
+    // push to stagger queue — the draw loop releases them one by one
+    if (newNodes.length > 0) pendingRef.current = [...pendingRef.current, ...newNodes]
+  }, [networks, placeNode])
+
+  useEffect(() => {
+    const canvas = canvasRef.current; if (!canvas) return
+    const ctx = canvas.getContext('2d')!
+    let t = 0
+    const draw = () => {
+      const W = canvas.width  = canvas.offsetWidth
+      const H = canvas.height = canvas.offsetHeight
+      // reposition nodes only when canvas dimensions actually change (not on effect restart)
+      const { w: lastW, h: lastH } = lastDimRef.current
+      if (W > 0 && H > 0 && (W !== lastW || H !== lastH)) {
+        lastDimRef.current = { w: W, h: H }
+        // Scale existing positions proportionally instead of recalculating
+        if (lastW > 0 && lastH > 0) {
+          const scaleX = W / lastW
+          const scaleY = H / lastH
+          nodesRef.current = nodesRef.current.map(nd => ({
+            ...nd,
+            x: (nd.x - lastW / 2) * scaleX + W / 2,
+            y: (nd.y - lastH / 2) * scaleY + H / 2,
+          }))
+        }
+      }
+      ctx.clearRect(0,0,W,H)
+      ctx.fillStyle = 'rgba(42,255,138,0.05)'
+      for (let gx=0;gx<W;gx+=28) for (let gy=0;gy<H;gy+=28) ctx.fillRect(gx,gy,1,1)
+      if (scanning) {
+        const sw = (t*0.015)%(Math.PI*2)
+        ctx.save(); ctx.translate(W/2,H/2)
+        ctx.beginPath(); ctx.moveTo(0,0); ctx.arc(0,0,Math.max(W,H),sw,sw+0.8)
+        ctx.fillStyle='rgba(42,255,138,0.04)'; ctx.fill()
+        ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(Math.cos(sw)*Math.max(W,H),Math.sin(sw)*Math.max(W,H))
+        ctx.strokeStyle='rgba(42,255,138,0.32)'; ctx.lineWidth=1; ctx.stroke(); ctx.restore()
+      }
+      for (let r=60;r<Math.max(W,H)*0.7;r+=70) {
+        ctx.beginPath(); ctx.arc(W/2,H/2,r,0,Math.PI*2)
+        ctx.strokeStyle='rgba(42,255,138,0.05)'; ctx.lineWidth=1; ctx.stroke()
+      }
+      ctx.strokeStyle='rgba(42,255,138,0.10)'; ctx.lineWidth=1
+      ctx.beginPath(); ctx.moveTo(W/2-12,H/2); ctx.lineTo(W/2+12,H/2); ctx.moveTo(W/2,H/2-12); ctx.lineTo(W/2,H/2+12); ctx.stroke()
+
+      const searchQ = searchRef.current.toLowerCase()
+      const fb = new Set(nodesRef.current.filter(nd=>FILTER_DEFS.find(f=>f.key===filter)!.match(nd.network)).map(nd=>nd.network.bssid))
+      const fhf = filter!=='all'
+
+      nodesRef.current.forEach(nd => {
+        const matchSearch = !searchQ || (nd.network.ssid ?? nd.network.bssid).toLowerCase().includes(searchQ)
+        const dim = (fhf && !fb.has(nd.network.bssid)) || !matchSearch
+        ctx.beginPath(); ctx.moveTo(W/2,H/2); ctx.lineTo(nd.x,nd.y)
+        ctx.strokeStyle = dim ? 'rgba(45,45,45,0.06)' : `${SG_RGBA}0.07)`; ctx.lineWidth=0.5; ctx.stroke()
+      })
+
+      nodesRef.current.forEach(nd => {
+        // ── advance entry animation ───────────────────────────────────────────
+        if (nd.enterT < 1) nd.enterT = Math.min(1, nd.enterT + 0.032)
+        const eased = nd.enterT < 1 ? 1 - Math.pow(1 - nd.enterT, 3) : 1  // ease-out-cubic
+
+        const pulse = Math.sin(t*0.04+nd.pulse)*0.5+0.5
+        const r     = nd.size * eased
+        const matchSearch = !searchQ || (nd.network.ssid ?? nd.network.bssid).toLowerCase().includes(searchQ)
+        const dim   = (fhf && !fb.has(nd.network.bssid)) || !matchSearch
+        const isSel = selected?.bssid===nd.network.bssid
+        const pct   = signalPct(nd.network.power)
+        const sCol  = signalColor(pct)
+
+        // ── entry ping ring ───────────────────────────────────────────────────
+        if (nd.enterT < 0.85 && !dim) {
+          const pingProgress = nd.enterT / 0.85
+          const pingR  = nd.size * (1 + pingProgress * 5)
+          const pingA  = (1 - pingProgress) * (isSel ? 0.5 : 0.35)
+          ctx.beginPath(); ctx.arc(nd.x, nd.y, pingR, 0, Math.PI * 2)
+          ctx.strokeStyle = `rgba(42,255,138,${pingA.toFixed(2)})`
+          ctx.lineWidth = 1.5; ctx.stroke()
+        }
+
+        if (dim) {
+          ctx.beginPath(); ctx.arc(nd.x,nd.y,r*0.6,0,Math.PI*2)
+          ctx.fillStyle=`rgba(42,42,42,${(0.42*eased).toFixed(2)})`; ctx.fill()
+          ctx.fillStyle=`rgba(65,65,65,${(0.25*eased).toFixed(2)})`; ctx.font='8px monospace'
+          ctx.globalAlpha=eased
+          ctx.fillText(nd.network.ssid??nd.network.bssid.slice(-8),nd.x+r+3,nd.y+3)
+          ctx.globalAlpha=1; return
+        }
+
+        if (isSel) {
+          ctx.beginPath(); ctx.arc(nd.x,nd.y,r+14+pulse*8,0,Math.PI*2)
+          ctx.strokeStyle=`${SG_RGBA}${(0.09+pulse*0.17).toFixed(2)})`; ctx.lineWidth=1.5; ctx.stroke()
+          ctx.beginPath(); ctx.arc(nd.x,nd.y,r+5,0,Math.PI*2)
+          ctx.strokeStyle='rgba(42,255,138,0.48)'; ctx.lineWidth=1.5; ctx.stroke()
+          ctx.beginPath(); ctx.arc(nd.x,nd.y,r+2,0,Math.PI*2)
+          ctx.fillStyle=SG; ctx.shadowColor=SG; ctx.shadowBlur=20; ctx.fill(); ctx.shadowBlur=0
+          ctx.globalAlpha=eased
+          ctx.fillStyle=SG; ctx.font='bold 9px monospace'
+          ctx.fillText(nd.network.ssid??nd.network.bssid,nd.x+r+6,nd.y+4)
+          ctx.globalAlpha=1; return
+        }
+
+        // normal — signal-intensity color
+        const alpha = (pulse*0.14).toFixed(2)
+        ctx.beginPath(); ctx.arc(nd.x,nd.y,r+4+pulse*4,0,Math.PI*2)
+        ctx.strokeStyle=sCol.replace(/[\d.]+\)$/,`${alpha})`); ctx.lineWidth=1; ctx.stroke()
+        ctx.beginPath(); ctx.arc(nd.x,nd.y,r,0,Math.PI*2)
+        ctx.fillStyle=sCol.replace(/[\d.]+\)$/,'0.70)'); ctx.shadowColor=sCol; ctx.shadowBlur=4; ctx.fill(); ctx.shadowBlur=0
+        ctx.globalAlpha=eased
+        ctx.fillStyle=sCol.replace(/[\d.]+\)$/,'0.48)'); ctx.font='9px monospace'
+        ctx.fillText(nd.network.ssid??nd.network.bssid.slice(-8),nd.x+r+3,nd.y+3)
+        ctx.globalAlpha=1
+      })
+
+      // ── stagger-reveal: pop one node from queue per interval ────────────────
+      if (pendingRef.current.length > 0) {
+        // adaptive: slow for first ~12 (dramatic), faster as count grows
+        const placed = nodesRef.current.length
+        const interval = placed < 12 ? 18 : placed < 40 ? 10 : placed < 100 ? 6 : 3
+        if (t - lastPopRef.current >= interval) {
+          nodesRef.current = [...nodesRef.current, pendingRef.current.shift()!]
+          lastPopRef.current = t
+        }
+      }
+
+      t++; frameRef.current=requestAnimationFrame(draw)
+    }
+    frameRef.current=requestAnimationFrame(draw)
+    return ()=>cancelAnimationFrame(frameRef.current)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[scanning,filter,selected])
+
+  const onMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const rect=canvasRef.current!.getBoundingClientRect()
+    const mx=e.clientX-rect.left,my=e.clientY-rect.top
+    let found: Network|null=null
+    for (const nd of nodesRef.current) {
+      if (hasFilter&&!matchBssids.has(nd.network.bssid)) continue
+      const dx=nd.x-mx,dy=nd.y-my
+      if (Math.sqrt(dx*dx+dy*dy)<nd.size+8){found=nd.network;break}
+    }
+    setHovered(found); setTooltip({x:mx+12,y:my-8})
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[hasFilter,matchBssids])
+
+  const onClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const rect=canvasRef.current!.getBoundingClientRect()
+    const mx=e.clientX-rect.left,my=e.clientY-rect.top
+    for (const nd of nodesRef.current) {
+      if (hasFilter&&!matchBssids.has(nd.network.bssid)) continue
+      const dx=nd.x-mx,dy=nd.y-my
+      if (Math.sqrt(dx*dx+dy*dy)<nd.size+8){setSelected(p=>p?.bssid===nd.network.bssid?null:nd.network);return}
+    }
+    setSelected(null)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[hasFilter,matchBssids])
+
+  return (
+    <div className="relative w-full h-full overflow-hidden">
+
+      {/* left: network intel */}
+      {selected && !attacking && (
+        <NetworkDetailPanel network={selected} onClose={()=>setSelected(null)} onStartAttack={n=>setAttacking(n)} />
+      )}
+
+      {/* right: RF list */}
+      <RFNetworkPanel networks={networks} selected={selected} onSelect={setSelected} search={search} onSearch={setSearch} open={netOpen} onToggle={()=>setNetOpen(o=>!o)} />
+
+      {/* radar canvas */}
+      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" style={{cursor:hovered?'pointer':'crosshair', zIndex:0}}
+        onMouseMove={onMouseMove} onMouseLeave={()=>setHovered(null)} onClick={onClick} />
+
+      {/* ── scanning sonar overlay ── */}
+      {scanning && (
+        <div className="absolute inset-0 pointer-events-none" style={{ zIndex: 5 }}>
+          {/* sonar pulse rings emanating from center */}
+          <div className="absolute inset-0 flex items-center justify-center">
+            <div className="relative" style={{ width: 64, height: 64 }}>
+              {[0, 0.5, 1.0, 1.5].map((delay, i) => (
+                <div
+                  key={i}
+                  className="absolute inset-0 rounded-full animate-ping"
+                  style={{
+                    border: `1px solid rgba(42,255,138,${0.30 - i * 0.05})`,
+                    animationDuration: '2s',
+                    animationDelay: `${delay}s`,
+                  }}
+                />
+              ))}
+            </div>
+          </div>
+          {/* counter — below center */}
+          <div
+            className="absolute left-1/2 -translate-x-1/2 font-mono text-[9px] tracking-[0.22em] whitespace-nowrap"
+            style={{ top: 'calc(50% + 50px)' }}
+          >
+            <span style={{ color: 'rgba(42,255,138,0.65)' }}>
+              {(nodesRef.current.length + pendingRef.current.length).toString().padStart(2, '0')}
+            </span>
+            <span style={{ color: 'rgba(42,255,138,0.28)' }}> SIGNALS ACQUIRED</span>
+          </div>
+          {/* pending bubble counter */}
+          {pendingRef.current.length > 0 && (
+            <div
+              className="absolute left-1/2 -translate-x-1/2 font-mono text-[8px] tracking-widest whitespace-nowrap animate-pulse"
+              style={{ top: 'calc(50% + 64px)', color: 'rgba(42,255,138,0.20)' }}
+            >
+              +{pendingRef.current.length} RENDERING…
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── center scan button (before first scan) ── */}
+      {!hasScanned && !scanning && (
+        <div className="absolute inset-0 flex items-center justify-center z-10">
+          <button
+            onClick={onStart}
+            disabled={!onStart}
+            className="relative flex flex-col items-center gap-5 group outline-none"
+          >
+            {/* Concentric pulsing rings */}
+            <div className="relative w-32 h-32 flex items-center justify-center">
+              <div
+                className="absolute inset-0 rounded-full animate-ping"
+                style={{ border: '1px solid rgba(42,255,138,0.16)', animationDuration: '2.4s' }}
+              />
+              <div
+                className="absolute w-24 h-24 rounded-full animate-ping"
+                style={{ border: '1px solid rgba(42,255,138,0.13)', animationDuration: '2.4s', animationDelay: '0.6s' }}
+              />
+              <div
+                className="absolute w-16 h-16 rounded-full animate-ping"
+                style={{ border: '1px solid rgba(42,255,138,0.20)', animationDuration: '2.4s', animationDelay: '1.2s' }}
+              />
+              {/* Core button */}
+              <div
+                className="relative w-14 h-14 rounded-full flex items-center justify-center transition-transform duration-200 group-hover:scale-110"
+                style={{
+                  background: 'rgba(42,255,138,0.08)',
+                  border: '1.5px solid rgba(42,255,138,0.55)',
+                  boxShadow: '0 0 32px rgba(42,255,138,0.24), inset 0 0 14px rgba(42,255,138,0.06)',
+                }}
+              >
+                <span
+                  className="text-2xl leading-none"
+                  style={{ color: '#2aff8a', filter: 'drop-shadow(0 0 10px #2aff8a)' }}
+                >
+                  ◎
+                </span>
+              </div>
+            </div>
+            {/* Label */}
+            <div className="flex flex-col items-center gap-1">
+              <span
+                className="text-[11px] font-bold tracking-[0.35em] transition-all duration-200 group-hover:tracking-[0.45em]"
+                style={{ color: '#2aff8a', textShadow: '0 0 18px rgba(42,255,138,0.40)' }}
+              >
+                INITIATE SCAN
+              </span>
+              <span
+                className="text-[8px] tracking-[0.2em]"
+                style={{ color: 'rgba(42,255,138,0.25)' }}
+              >
+                CLICK TO BEGIN
+              </span>
+            </div>
+          </button>
+        </div>
+      )}
+
+      {/* ── center rescan / stop button (after first scan) ── */}
+      {(hasScanned || scanning) && (
+        <div className="absolute inset-0 flex items-center justify-center z-10 pointer-events-none">
+          <button
+            onClick={scanning ? onStop : onStart}
+            title={scanning ? 'Stop Scan' : 'Rescan'}
+            className="relative flex items-center justify-center group outline-none pointer-events-auto"
+          >
+            <div className="relative w-16 h-16 flex items-center justify-center">
+              {/* outer ping ring */}
+              <div
+                className="absolute inset-0 rounded-full animate-ping"
+                style={{
+                  border: `1px solid ${scanning ? 'rgba(255,68,68,0.18)' : 'rgba(42,255,138,0.16)'}`,
+                  animationDuration: '2.4s',
+                }}
+              />
+              {/* mid ping ring */}
+              <div
+                className="absolute w-12 h-12 rounded-full animate-ping"
+                style={{
+                  border: `1px solid ${scanning ? 'rgba(255,68,68,0.13)' : 'rgba(42,255,138,0.13)'}`,
+                  animationDuration: '2.4s',
+                  animationDelay: '0.8s',
+                }}
+              />
+              {/* core */}
+              <div
+                className="relative w-9 h-9 rounded-full flex items-center justify-center transition-transform duration-200 group-hover:scale-110"
+                style={{
+                  background: scanning ? 'rgba(255,68,68,0.10)' : 'rgba(42,255,138,0.08)',
+                  border: `1.5px solid ${scanning ? 'rgba(255,68,68,0.55)' : 'rgba(42,255,138,0.55)'}`,
+                  boxShadow: scanning
+                    ? '0 0 24px rgba(255,68,68,0.22), inset 0 0 12px rgba(255,68,68,0.06)'
+                    : '0 0 24px rgba(42,255,138,0.22), inset 0 0 12px rgba(42,255,138,0.06)',
+                }}
+              >
+                <span
+                  className={`text-base leading-none ${scanning ? 'animate-pulse' : ''}`}
+                  style={{
+                    color: scanning ? '#ff6b6b' : '#2aff8a',
+                    filter: `drop-shadow(0 0 8px ${scanning ? '#ff6b6b' : '#2aff8a'})`,
+                  }}
+                >
+                  {scanning ? '■' : '↺'}
+                </span>
+              </div>
+            </div>
+          </button>
+        </div>
+      )}
+
+      {/* hover tooltip */}
+      {hovered && !selected && (
+        <div className="absolute pointer-events-none z-20 rounded px-2.5 py-2 text-[10px] min-w-[150px]"
+          style={{ left:tooltip.x, top:tooltip.y, background:'rgba(4,8,12,0.90)', border:'1px solid rgba(42,255,138,0.10)', backdropFilter:'blur(8px)' }}>
+          <div className="font-bold" style={{color:'rgba(42,255,138,0.88)'}}>{hovered.ssid??'(hidden)'}</div>
+          <div className="mt-0.5 font-mono" style={{fontSize:9,color:'rgba(42,255,138,0.32)'}}>{hovered.bssid}</div>
+          <div className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5" style={{fontSize:9,color:'rgba(42,255,138,0.42)'}}>
+            <span>CH {hovered.channel??'?'}</span>
+            <span>{encLabel(hovered.encryption)}</span>
+            <span>{hovered.power??'?'} dBm</span>
+            {hovered.wps_enabled&&<span style={{color:'rgba(255,136,0,0.75)'}}>WPS</span>}
+          </div>
+        </div>
+      )}
+
+      {/* attack animation */}
+      {attacking && (
+        <AttackAnimation network={attacking} onFinish={()=>{setAttacking(null);setSelected(null)}} onHandoff={n=>{onAttack(n)}} />
       )}
     </div>
   )

@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     default_interface: str = "wlan0"
     work_dir: str = "/tmp/wifi_suite_captures"
     wordlist_path: str = "/usr/share/wordlists/rockyou.txt"
+    wordlists_dir: str = "/usr/share/wordlists"
 
     max_concurrent_attacks: int = 5
     scan_timeout: int = 60

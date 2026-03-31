@@ -1,12 +1,17 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
+import { FILTER_DEFS, type MapFilter } from '../../utils/networkFilters'
+import type { Network } from '../../types/network'
 
 interface Props {
   apCount: number
   clientCount: number
   vulnCount: number
-  scanning: boolean
-  onStart: () => void
-  onStop: () => void
+  scanning?: boolean
+  onStart?: () => void
+  onStop?: () => void
+  filter?: MapFilter
+  onFilterChange?: (f: MapFilter) => void
+  networks?: Network[]
 }
 
 function LatencyBar() {
@@ -54,7 +59,7 @@ function StatCard({
   color: string
 }) {
   return (
-    <div className="flex flex-col items-center px-4 py-1 border-r border-[#1a2f1a] last:border-r-0">
+    <div className="flex flex-col items-center px-4 py-1">
       <span
         className="text-xl font-bold tabular-nums leading-none"
         style={{ color, textShadow: `0 0 12px ${color}60` }}
@@ -66,45 +71,63 @@ function StatCard({
   )
 }
 
-export function StatsBar({ apCount, clientCount, vulnCount, scanning, onStart, onStop }: Props) {
+export function StatsBar({ apCount, clientCount, vulnCount, filter = 'all', onFilterChange, networks = [] }: Props) {
   return (
-    <footer className="flex items-center border-t border-[#1a2f1a] bg-[#080c10] px-4 py-2 gap-4 shrink-0">
-      {/* Stats */}
+    <footer className="flex items-center px-6 py-2.5 gap-6 shrink-0">
+      {/* Floating stats — no background, no border */}
       <div className="flex items-center">
-        <StatCard label="ACTIVE ACCESS POINTS"  value={apCount}     color="#2aff8a" />
-        <StatCard label="CONNECTED CLIENTS"     value={clientCount} color="#00e5ff" />
-        <StatCard label="CRITICAL VULNERABILITIES" value={vulnCount}  color="#ff6b35" />
+        <StatCard label="ACTIVE ACCESS POINTS"     value={apCount}     color="#2aff8a" />
+        <StatCard label="CONNECTED CLIENTS"        value={clientCount} color="#00e5ff" />
+        <StatCard label="CRITICAL VULNERABILITIES" value={vulnCount}   color="#ff6b35" />
       </div>
+
+      {/* Divider */}
+      <div className="w-px self-stretch" style={{ background: 'rgba(42,255,138,0.08)' }} />
+
+      {/* Filter buttons */}
+      {onFilterChange && (
+        <div className="flex items-center gap-2">
+          {FILTER_DEFS.map(({ key, label, match }) => {
+            const count  = networks.filter(match).length
+            const active = filter === key
+            return (
+              <button
+                key={key}
+                onClick={() => onFilterChange(key)}
+                className="flex items-center gap-2 px-3.5 py-1.5 rounded transition-all duration-150"
+                style={{
+                  border:     `1px solid ${active ? 'rgba(42,255,138,0.60)' : 'rgba(42,255,138,0.10)'}`,
+                  background: active ? 'rgba(42,255,138,0.13)' : 'rgba(4,8,12,0.55)',
+                  color:      active ? '#2aff8a' : 'rgba(42,255,138,0.32)',
+                  boxShadow:  active ? '0 0 12px rgba(42,255,138,0.18)' : 'none',
+                }}
+              >
+                <span
+                  className="w-2 h-2 rounded-full shrink-0"
+                  style={{
+                    background: active ? '#2aff8a' : 'rgba(42,255,138,0.22)',
+                    boxShadow:  active ? '0 0 6px #2aff8a' : 'none',
+                  }}
+                />
+                <span className="text-[11px] font-bold tracking-widest">{label}</span>
+                <span
+                  className="text-[10px] tabular-nums font-mono"
+                  style={{ color: active ? 'rgba(42,255,138,0.70)' : 'rgba(42,255,138,0.20)' }}
+                >
+                  {count}
+                </span>
+              </button>
+            )
+          })}
+        </div>
+      )}
 
       <div className="flex-1" />
 
-      {/* Latency chart */}
-      <div className="w-36 border border-[#1a2f1a] rounded p-2 bg-[#0a140a]">
+      {/* Latency chart — subtle */}
+      <div className="w-32 opacity-50">
         <LatencyBar />
       </div>
-
-      {/* CTA */}
-      {scanning ? (
-        <button
-          onClick={onStop}
-          className="flex flex-col items-center px-5 py-2 border border-[#ff4444]/50 rounded bg-[#ff4444]/10 hover:bg-[#ff4444]/20 transition-colors group"
-        >
-          <span className="text-[10px] text-[#ff6b6b]/60 tracking-widest">SCANNING_ACTIVE</span>
-          <span className="text-[11px] font-bold text-[#ff6b6b] tracking-widest group-hover:text-[#ff4444]">
-            ■ STOP SEQUENCE
-          </span>
-        </button>
-      ) : (
-        <button
-          onClick={onStart}
-          className="flex flex-col items-center px-5 py-2 border border-[#2aff8a]/40 rounded bg-[#2aff8a]/10 hover:bg-[#2aff8a]/20 hover:border-[#2aff8a]/70 transition-colors group"
-        >
-          <span className="text-[10px] text-[#2aff8a]/50 tracking-widest">PENETRATION_READY</span>
-          <span className="text-[11px] font-bold text-[#2aff8a] tracking-widest group-hover:shadow-[0_0_8px_#2aff8a]">
-            ▶ INITIATE SEQUENCE
-          </span>
-        </button>
-      )}
     </footer>
   )
 }

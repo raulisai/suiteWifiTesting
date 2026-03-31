@@ -2,10 +2,9 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { KineticSidebar }     from '../components/kinetic/KineticSidebar'
 import { KineticHeader }      from '../components/kinetic/KineticHeader'
 import { NetworkMap }         from '../components/kinetic/NetworkMap'
-import { AlertFeed }          from '../components/kinetic/AlertFeed'
+import { type MapFilter, isVulnerable } from '../utils/networkFilters'
 import { StatsBar }           from '../components/kinetic/StatsBar'
 import { AttackConsole }      from '../components/kinetic/AttackConsole'
-import { KineticInfoPanel }   from '../components/kinetic/KineticInfoPanel'
 import { KineticCampaigns }   from '../components/kinetic/KineticCampaigns'
 import { KineticCredentials } from '../components/kinetic/KineticCredentials'
 import { KineticReports }     from '../components/kinetic/KineticReports'
@@ -27,9 +26,13 @@ export interface KineticAlert {
 export type KineticView = 'map' | 'console' | 'campaigns' | 'credentials' | 'reports'
 
 export function KineticTerminal() {
-  const { networks, addNetwork } = useNetworksStore()
+  const { networks, addNetwork, setNetworks } = useNetworksStore()
 
-  /* ── auto-fetch interfaces on mount ── */
+  /* ── start with empty map on mount ── */
+  useEffect(() => {
+    setNetworks([])
+  }, [setNetworks])
+
   useInterfaces()
   const iface = useInterfacesStore((s) => s.selected)
 
@@ -42,6 +45,7 @@ export function KineticTerminal() {
   const [scanLines, setScanLines]     = useState<string[]>([])
   const [attackLines, setAttackLines] = useState<string[]>([])
   const [attackTarget, setAttackTarget] = useState<Network | null>(null)
+  const [mapFilter, setMapFilter]     = useState<MapFilter>('all')
   const alertId = useRef(0)
   const wsRef   = useRef<WebSocket | null>(null)
 
@@ -61,6 +65,10 @@ export function KineticTerminal() {
     setAlerts(prev => [a, ...prev].slice(0, 40))
   }, [])
 
+  const dismissAlert = useCallback((id: number) => {
+    setAlerts(prev => prev.filter(a => a.id !== id))
+  }, [])
+
   /* ── start scan via WS ── */
   const startScan = useCallback(() => {
     if (wsRef.current) return
@@ -75,7 +83,7 @@ export function KineticTerminal() {
       try { ev = JSON.parse(msg.data) } catch { return }
 
       if (ev.type === 'ready') {
-        ws.send(JSON.stringify({ interface: iface, duration: 60 }))
+        ws.send(JSON.stringify({ interface: iface, duration: 30 }))
         return
       }
 
@@ -83,7 +91,7 @@ export function KineticTerminal() {
         setScanLines(prev => [...prev.slice(-200), ev.message!])
       }
 
-      if (ev.type === 'data' && ev.data) {
+      if (ev.type === 'network_found' && ev.data) {
         const d = ev.data as Record<string, unknown>
         if (d.bssid) {
           addNetwork(d as unknown as Network)
@@ -110,9 +118,7 @@ export function KineticTerminal() {
   /* ── derive stats ── */
   const apCount   = networks.length
   const clientCount = networks.reduce((s, n) => s + (n.wps_enabled ? 1 : 0) * 8 + 3, 0)
-  const vulnCount  = networks.filter(n =>
-    n.wps_enabled && !n.wps_locked || n.encryption === 'WEP'
-  ).length
+  const vulnCount  = networks.filter(isVulnerable).length
 
   return (
     <div className="flex h-screen bg-[#080c10] text-[#a8f0c6] font-mono overflow-hidden">
@@ -128,10 +134,9 @@ export function KineticTerminal() {
           scanning={scanning}
           scanCount={scanCount}
           packetRate={packetRate}
+          alerts={alerts}
+          onDismissAlert={dismissAlert}
         />
-
-        {/* Collapsible Intel Panel */}
-        <KineticInfoPanel networks={networks} />
 
         {/* Body */}
         <div className="flex flex-1 min-h-0">
@@ -147,6 +152,9 @@ export function KineticTerminal() {
                   pushAlert('handshake', 'TARGETING', n.ssid ?? n.bssid)
                   setView('console')
                 }}
+                onStart={startScan}
+                onStop={stopScan}
+                filter={mapFilter}
               />
             ) : view === 'console' ? (
               <AttackConsole
@@ -166,10 +174,7 @@ export function KineticTerminal() {
             )}
           </div>
 
-          {/* Right alert feed — only visible for map/console */}
-          {(view === 'map' || view === 'console') && (
-            <AlertFeed alerts={alerts} />
-          )}
+
         </div>
 
         {/* Bottom stats + CTA */}
@@ -180,6 +185,9 @@ export function KineticTerminal() {
           scanning={scanning}
           onStart={startScan}
           onStop={stopScan}
+          filter={mapFilter}
+          onFilterChange={setMapFilter}
+          networks={networks}
         />
       </div>
     </div>
