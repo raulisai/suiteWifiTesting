@@ -1,14 +1,20 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { KineticSidebar }    from '../components/kinetic/KineticSidebar'
-import { KineticHeader }     from '../components/kinetic/KineticHeader'
-import { NetworkMap }        from '../components/kinetic/NetworkMap'
-import { AlertFeed }         from '../components/kinetic/AlertFeed'
-import { StatsBar }          from '../components/kinetic/StatsBar'
-import { AttackConsole }     from '../components/kinetic/AttackConsole'
-import { useNetworksStore }  from '../store/networks'
+import { KineticSidebar }     from '../components/kinetic/KineticSidebar'
+import { KineticHeader }      from '../components/kinetic/KineticHeader'
+import { NetworkMap }         from '../components/kinetic/NetworkMap'
+import { AlertFeed }          from '../components/kinetic/AlertFeed'
+import { StatsBar }           from '../components/kinetic/StatsBar'
+import { AttackConsole }      from '../components/kinetic/AttackConsole'
+import { KineticInfoPanel }   from '../components/kinetic/KineticInfoPanel'
+import { KineticCampaigns }   from '../components/kinetic/KineticCampaigns'
+import { KineticCredentials } from '../components/kinetic/KineticCredentials'
+import { KineticReports }     from '../components/kinetic/KineticReports'
+import { useNetworksStore }   from '../store/networks'
+import { useInterfaces }      from '../hooks/useInterfaces'
+import { useInterfacesStore } from '../store/interfaces'
 import type { Network }       from '../types/network'
-import { wsUrl }             from '../api/client'
-import type { WSEvent }      from '../types/attack'
+import { wsUrl }              from '../api/client'
+import type { WSEvent }       from '../types/attack'
 
 export interface KineticAlert {
   id: number
@@ -18,10 +24,14 @@ export interface KineticAlert {
   ts: number
 }
 
-export type KineticView = 'map' | 'console'
+export type KineticView = 'map' | 'console' | 'campaigns' | 'credentials' | 'reports'
 
 export function KineticTerminal() {
   const { networks, addNetwork } = useNetworksStore()
+
+  /* ── auto-fetch interfaces on mount ── */
+  useInterfaces()
+  const iface = useInterfacesStore((s) => s.selected)
 
   /* ── live scan state ── */
   const [scanning, setScanning]       = useState(false)
@@ -29,9 +39,9 @@ export function KineticTerminal() {
   const [scanCount, setScanCount]     = useState(34221)
   const [alerts, setAlerts]           = useState<KineticAlert[]>([])
   const [view, setView]               = useState<KineticView>('map')
-  const [iface, setIface]             = useState('wlan0mon')
   const [scanLines, setScanLines]     = useState<string[]>([])
   const [attackLines, setAttackLines] = useState<string[]>([])
+  const [attackTarget, setAttackTarget] = useState<Network | null>(null)
   const alertId = useRef(0)
   const wsRef   = useRef<WebSocket | null>(null)
 
@@ -118,9 +128,10 @@ export function KineticTerminal() {
           scanning={scanning}
           scanCount={scanCount}
           packetRate={packetRate}
-          iface={iface}
-          setIface={setIface}
         />
+
+        {/* Collapsible Intel Panel */}
+        <KineticInfoPanel networks={networks} />
 
         {/* Body */}
         <div className="flex flex-1 min-h-0">
@@ -132,24 +143,33 @@ export function KineticTerminal() {
                 networks={networks}
                 scanning={scanning}
                 onAttack={(n) => {
+                  setAttackTarget(n)
                   pushAlert('handshake', 'TARGETING', n.ssid ?? n.bssid)
                   setView('console')
                 }}
               />
-            ) : (
+            ) : view === 'console' ? (
               <AttackConsole
                 networks={networks}
-                iface={iface}
+                initialTarget={attackTarget}
                 scanLines={scanLines}
                 attackLines={attackLines}
                 setAttackLines={setAttackLines}
                 pushAlert={pushAlert}
               />
+            ) : view === 'campaigns' ? (
+              <KineticCampaigns />
+            ) : view === 'credentials' ? (
+              <KineticCredentials />
+            ) : (
+              <KineticReports />
             )}
           </div>
 
-          {/* Right alert feed */}
-          <AlertFeed alerts={alerts} />
+          {/* Right alert feed — only visible for map/console */}
+          {(view === 'map' || view === 'console') && (
+            <AlertFeed alerts={alerts} />
+          )}
         </div>
 
         {/* Bottom stats + CTA */}

@@ -3,10 +3,12 @@ import type { Network } from '../../types/network'
 import type { KineticAlert } from '../../pages/KineticTerminal'
 import type { WSEvent } from '../../types/attack'
 import { wsUrl } from '../../api/client'
+import { useInterfacesStore } from '../../store/interfaces'
 
 interface Props {
   networks: Network[]
-  iface: string
+  /** Pre-select this network when switching to console view */
+  initialTarget?: Network | null
   scanLines: string[]
   attackLines: string[]
   setAttackLines: React.Dispatch<React.SetStateAction<string[]>>
@@ -51,14 +53,23 @@ function TermLines({ lines, color }: { lines: string[]; color: string }) {
 }
 
 export function AttackConsole({
-  networks, iface, scanLines, attackLines, setAttackLines, pushAlert,
+  networks, initialTarget, scanLines, attackLines, setAttackLines, pushAlert,
 }: Props) {
+  const iface = useInterfacesStore((s) => s.selected)
   const [attackType, setAttackType]   = useState<AttackType>('handshake')
   const [targetBssid, setTargetBssid] = useState('')
   const [wordlist, setWordlist]       = useState('/usr/share/wordlists/rockyou.txt')
   const [channel, setChannel]         = useState('6')
   const [running, setRunning]         = useState(false)
   const wsRef = useRef<WebSocket | null>(null)
+
+  /* Apply pre-selected target from network grid */
+  useEffect(() => {
+    if (initialTarget) {
+      setTargetBssid(initialTarget.bssid)
+      if (initialTarget.channel) setChannel(String(initialTarget.channel))
+    }
+  }, [initialTarget?.bssid]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const meta = ATTACK_META[attackType]
 

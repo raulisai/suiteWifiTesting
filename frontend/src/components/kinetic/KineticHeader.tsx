@@ -1,11 +1,10 @@
 import { useEffect, useState } from 'react'
+import { useInterfacesStore } from '../../store/interfaces'
 
 interface Props {
   scanning: boolean
   scanCount: number
   packetRate: number
-  iface: string
-  setIface: (v: string) => void
 }
 
 function Blink({ active }: { active: boolean }) {
@@ -24,9 +23,14 @@ function Blink({ active }: { active: boolean }) {
   )
 }
 
-export function KineticHeader({ scanning, scanCount, packetRate, iface, setIface }: Props) {
-  const now = new Date()
-  const ts = now.toLocaleTimeString('en-US', { hour12: false })
+export function KineticHeader({ scanning, scanCount, packetRate }: Props) {
+  const { interfaces, selected, loading, fetch, select } = useInterfacesStore()
+  const [ts, setTs] = useState(() => new Date().toLocaleTimeString('en-US', { hour12: false }))
+
+  useEffect(() => {
+    const t = setInterval(() => setTs(new Date().toLocaleTimeString('en-US', { hour12: false })), 1000)
+    return () => clearInterval(t)
+  }, [])
 
   return (
     <header className="flex items-center justify-between px-4 py-2 border-b border-[#1a2f1a] bg-[#080c10] shrink-0">
@@ -56,15 +60,55 @@ export function KineticHeader({ scanning, scanCount, packetRate, iface, setIface
 
       {/* Right: interface selector + clock */}
       <div className="flex items-center gap-4 text-[10px]">
-        <label className="text-[#2aff8a]/50 flex items-center gap-2">
-          IFACE:
-          <input
-            value={iface}
-            onChange={e => setIface(e.target.value)}
-            className="bg-[#0d1f0d] border border-[#2aff8a]/20 rounded px-2 py-0.5 text-[#2aff8a] w-24 font-mono text-[10px] focus:outline-none focus:border-[#2aff8a]/50"
-            disabled={scanning}
-          />
-        </label>
+        <div className="flex items-center gap-1.5">
+          <span className="text-[#2aff8a]/40">IFACE:</span>
+
+          {loading ? (
+            <span className="text-[#2aff8a]/25 animate-pulse text-[9px] tracking-widest">DETECTING…</span>
+          ) : interfaces.length === 0 ? (
+            <span className="text-[#ff4444]/60 text-[9px] tracking-widest">NO INTERFACE</span>
+          ) : (
+            <select
+              value={selected}
+              onChange={(e) => select(e.target.value)}
+              disabled={scanning}
+              className="bg-[#0d1f0d] border border-[#2aff8a]/20 rounded px-2 py-0.5 text-[#2aff8a] font-mono text-[10px] focus:outline-none focus:border-[#2aff8a]/50 disabled:opacity-50 cursor-pointer"
+            >
+              {interfaces.map((i) => (
+                <option key={i.name} value={i.name}>
+                  {i.name}{i.type ? ` [${i.type}]` : ''}
+                </option>
+              ))}
+            </select>
+          )}
+
+          <button
+            onClick={fetch}
+            disabled={loading || scanning}
+            title="Refresh interfaces"
+            className="text-[#2aff8a]/25 hover:text-[#2aff8a] disabled:opacity-30 transition-colors text-sm leading-none"
+          >
+            ↻
+          </button>
+
+          {/* Type badge for selected interface */}
+          {selected && (() => {
+            const iface = interfaces.find((i) => i.name === selected)
+            if (!iface?.type) return null
+            const mon = iface.type === 'monitor'
+            return (
+              <span
+                className="text-[8px] px-1 rounded border tracking-wide"
+                style={{
+                  color: mon ? 'rgba(42,255,138,0.7)' : 'rgba(255,170,0,0.7)',
+                  borderColor: mon ? 'rgba(42,255,138,0.25)' : 'rgba(255,170,0,0.25)',
+                }}
+              >
+                {iface.type.toUpperCase()}
+              </span>
+            )
+          })()}
+        </div>
 
         <span className="text-[#2aff8a]/30 tabular-nums">{ts}</span>
 

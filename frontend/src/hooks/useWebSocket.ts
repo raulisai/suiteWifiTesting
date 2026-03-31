@@ -37,6 +37,17 @@ export function useWebSocket({
   const [status, setStatus] = useState<WSStatus>('idle')
   const wsRef = useRef<WebSocket | null>(null)
 
+  // Keep refs so the stable `connect` callback always sees the latest values
+  // without those values appearing in its dependency array.
+  // If config/onEvent were deps, a new object literal on every render would
+  // recreate `connect`, triggering the useEffect cleanup which calls
+  // disconnect() and closes a WebSocket that is still in CONNECTING state —
+  // causing the browser to fire onerror (code 1006) and the error toast.
+  const configRef = useRef(config)
+  configRef.current = config
+  const onEventRef = useRef(onEvent)
+  onEventRef.current = onEvent
+
   const connect = useCallback(() => {
     if (wsRef.current && wsRef.current.readyState < WebSocket.CLOSING) return
 
@@ -59,8 +70,9 @@ export function useWebSocket({
       switch (event.type) {
         case 'ready':
           setStatus('ready')
-          // Send config immediately
-          ws.send(JSON.stringify(config))
+          // Use ref so we always send the latest config without needing it
+          // as a useCallback dependency.
+          ws.send(JSON.stringify(configRef.current))
           break
         case 'start':
           setStatus('running')
@@ -80,7 +92,7 @@ export function useWebSocket({
           break
       }
 
-      onEvent?.(event)
+      onEventRef.current?.(event)
     }
 
     ws.onerror = () => {
@@ -92,7 +104,7 @@ export function useWebSocket({
       setStatus('closed')
       wsRef.current = null
     }
-  }, [path, config, onEvent])
+  }, [path])  // Only `path` as dep — config/onEvent are accessed via refs
 
   const disconnect = useCallback(() => {
     wsRef.current?.close()

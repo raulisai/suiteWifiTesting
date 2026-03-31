@@ -151,11 +151,15 @@ class ScannerService:
                         seen_bssids.add(bssid)
                         yield net
         finally:
-            try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=3)
-            except (ProcessLookupError, asyncio.TimeoutError):
-                pass
+            # proc may be unbound if create_subprocess_exec raised before
+            # assignment (e.g. FileNotFoundError was re-raised as RuntimeError).
+            _proc = locals().get("proc")
+            if _proc is not None:
+                try:
+                    _proc.terminate()
+                    await asyncio.wait_for(_proc.wait(), timeout=3)
+                except (ProcessLookupError, asyncio.TimeoutError):
+                    pass
 
     async def get_networks(self, db: AsyncSession) -> list[Network]:
         """Retrieve all networks, newest first."""

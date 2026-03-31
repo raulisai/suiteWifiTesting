@@ -1,5 +1,5 @@
 import { apiClient } from './client'
-import type { Credential } from '../types/credential'
+import type { Credential, Handshake } from '../types/credential'
 
 export const credentialsApi = {
   list: () =>
@@ -10,4 +10,16 @@ export const credentialsApi = {
 
   delete: (id: number) =>
     apiClient.delete(`/api/credentials/${id}`),
+
+  listHandshakes: () =>
+    apiClient.get<Handshake[]>('/api/credentials/handshakes').then((r) => r.data),
+
+  deleteHandshake: (id: number) =>
+    apiClient.delete(`/api/credentials/handshakes/${id}`),
+
+  handshakeContent: (id: number) =>
+    apiClient.get<string>(`/api/credentials/handshakes/${id}/content`, {
+      responseType: 'text',
+      transformResponse: [(d) => d],
+    }).then((r) => r.data),
 }

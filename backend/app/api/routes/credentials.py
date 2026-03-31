@@ -1,11 +1,15 @@
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict
 from datetime import datetime
+from pathlib import Path
+import binascii
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_session
 from app.models.credential import Credential
+from app.models.handshake import Handshake
 from app.models.network import Network
 
 router = APIRouter(prefix="/api/credentials", tags=["credentials"])
@@ -22,6 +26,90 @@ class CredentialResponse(BaseModel):
     found_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class HandshakeResponse(BaseModel):
+    id: int
+    network_id: int
+    bssid: str
+    ssid: str | None
+    file_path: str
+    file_type: str
+    verified: bool
+    captured_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+@router.get("/handshakes", response_model=list[HandshakeResponse])
+async def list_handshakes(db: AsyncSession = Depends(get_session)):
+    """Return all captured handshake/hash files joined with network info, newest first."""
+    result = await db.execute(
+        select(Handshake, Network)
+        .join(Network, Handshake.network_id == Network.id)
+        .order_by(Handshake.captured_at.desc())
+    )
+    rows = result.all()
+    return [
+        HandshakeResponse(
+            id=hs.id,
+            network_id=hs.network_id,
+            bssid=net.bssid,
+            ssid=net.ssid,
+            file_path=hs.file_path,
+            file_type=hs.file_type,
+            verified=hs.verified,
+            captured_at=hs.captured_at,
+        )
+        for hs, net in rows
+    ]
+
+
+@router.delete("/handshakes/{handshake_id}", status_code=204)
+async def delete_handshake(handshake_id: int, db: AsyncSession = Depends(get_session)):
+    """Remove a handshake record."""
+    result = await db.execute(select(Handshake).where(Handshake.id == handshake_id))
+    hs = result.scalar_one_or_none()
+    if hs is None:
+        raise HTTPException(status_code=404, detail="Handshake not found.")
+    await db.delete(hs)
+    await db.commit()
+
+
+@router.get("/handshakes/{handshake_id}/content", response_class=PlainTextResponse)
+async def get_handshake_content(
+    handshake_id: int, db: AsyncSession = Depends(get_session)
+):
+    """Return the raw content of a captured hash file as plain text.
+    hc22000 files → plain text lines.
+    cap/pcapng files → annotated hex dump (first 512 bytes).
+    """
+    result = await db.execute(select(Handshake).where(Handshake.id == handshake_id))
+    hs = result.scalar_one_or_none()
+    if hs is None:
+        raise HTTPException(status_code=404, detail="Handshake not found.")
+
+    p = Path(hs.file_path)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail=f"File not found on disk: {hs.file_path}")
+
+    if hs.file_type == "hc22000":
+        # Human-readable hashcat 22000 format
+        return p.read_text(errors="replace")
+
+    # Binary capture — return a hex dump (first 512 bytes) with offsets
+    raw = p.read_bytes()[:512]
+    lines: list[str] = [
+        f"# {p.name}  [{hs.file_type.upper()}]  {p.stat().st_size} bytes",
+        f"# Showing first {len(raw)} bytes",
+        "",
+    ]
+    for offset in range(0, len(raw), 16):
+        chunk = raw[offset:offset + 16]
+        hex_part  = " ".join(f"{b:02x}" for b in chunk).ljust(47)
+        ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        lines.append(f"{offset:08x}  {hex_part}  |{ascii_part}|")
+    return "\n".join(lines)
 
 
 @router.get("", response_model=list[CredentialResponse])
