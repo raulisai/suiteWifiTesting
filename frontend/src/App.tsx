@@ -1,6 +1,7 @@
 import { Outlet } from 'react-router-dom'
-import { Sidebar } from './components/layout/Sidebar'
-import { TopBar }  from './components/layout/TopBar'
+import { Sidebar }         from './components/layout/Sidebar'
+import { TopBar }          from './components/layout/TopBar'
+import { ToastContainer }  from './components/ToastContainer'
 
 export default function App() {
   return (
@@ -12,6 +13,8 @@ export default function App() {
           <Outlet />
         </main>
       </div>
+      {/* Global toast notifications — renders above everything */}
+      <ToastContainer />
     </div>
   )
 }

@@ -2,19 +2,22 @@ import { useState } from 'react'
 import type { Network } from '../types/network'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { useTerminalStore } from '../store/terminal'
+import { useInterfacesStore } from '../store/interfaces'
 import type { WSEvent } from '../types/attack'
 
 interface AttackPanelProps {
   network: Network
-  interface_: string
+  /** @deprecated — la interfaz se lee del store global. Se mantiene por compatibilidad. */
+  interface_?: string
   onClose: () => void
 }
 
 type AttackMode = 'handshake' | 'wps_pixie' | 'wps_brute' | 'pmkid'
 
-export function AttackPanel({ network, interface_, onClose }: AttackPanelProps) {
+export function AttackPanel({ network, onClose }: AttackPanelProps) {
   const [mode, setMode] = useState<AttackMode>('handshake')
   const appendLine = useTerminalStore((s) => s.appendLine)
+  const interface_ = useInterfacesStore((s) => s.selected)
 
   const configMap: Record<AttackMode, { path: string; config: Record<string, unknown> }> = {
     handshake: {

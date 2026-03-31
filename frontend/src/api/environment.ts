@@ -1,5 +1,17 @@
 import { apiClient } from './client'
 
+export interface WifiInterface {
+  name: string
+  phy: string
+  ifindex: number
+  addr: string | null
+  type: string | null      // "managed" | "monitor" | "AP" | ...
+  channel: number | null
+  frequency: number | null // MHz
+  ssid: string | null
+  txpower: number | null   // dBm
+}
+
 export interface ToolInfo {
   name: string
   binary: string
@@ -23,6 +35,9 @@ export interface EnvironmentSummary {
 export const environmentApi = {
   getSummary: () =>
     apiClient.get<EnvironmentSummary>('/api/environment/summary').then((r) => r.data),
+
+  getInterfaces: () =>
+    apiClient.get<WifiInterface[]>('/api/environment/interfaces').then((r) => r.data),
 
   checkAll: () =>
     apiClient.get<ToolInfo[]>('/api/environment/check').then((r) => r.data),

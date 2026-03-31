@@ -30,3 +30,31 @@
     background: #3e3e3e;
   }
 }
+
+/* ── Toast animations ─────────────────────────────────────────────────────── */
+@keyframes toast-in {
+  from { transform: translateX(110%); opacity: 0; }
+  to   { transform: translateX(0);    opacity: 1; }
+}
+
+@keyframes toast-out {
+  from { transform: translateX(0);    opacity: 1; max-height: 120px; margin-bottom: 0.5rem; }
+  to   { transform: translateX(110%); opacity: 0; max-height: 0;     margin-bottom: 0; }
+}
+
+@keyframes toast-progress {
+  from { width: 100%; }
+  to   { width: 0%; }
+}
+
+.toast-enter {
+  animation: toast-in 0.22s cubic-bezier(0.21, 1.02, 0.73, 1) forwards;
+}
+
+.toast-exit {
+  animation: toast-out 0.28s ease-in forwards;
+}
+
+.toast-progress {
+  animation: toast-progress linear forwards;
+}

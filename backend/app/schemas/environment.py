@@ -1,6 +1,18 @@
 from pydantic import BaseModel
 
 
+class WifiInterface(BaseModel):
+    name: str                    # e.g. "wlan0", "wlan0mon"
+    phy: str                     # e.g. "phy#3"
+    ifindex: int
+    addr: str | None = None      # MAC address
+    type: str | None = None      # "managed" | "monitor" | "AP" etc.
+    channel: int | None = None
+    frequency: float | None = None   # MHz
+    ssid: str | None = None
+    txpower: float | None = None     # dBm
+
+
 class ToolCheckResponse(BaseModel):
     name: str
     binary: str

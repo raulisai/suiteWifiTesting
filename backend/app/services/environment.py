@@ -214,6 +214,92 @@ class EnvironmentService:
         success = "completada" in output.lower()
         return success, output
 
+    async def list_interfaces(self) -> list[dict]:
+        """Parse ``iw dev`` output and return a list of wireless interfaces.
+
+        Returns:
+            List of dicts with keys: name, phy, ifindex, addr, type,
+            channel, frequency, ssid, txpower.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "iw", "dev",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        except (FileNotFoundError, asyncio.TimeoutError):
+            return []
+
+        raw = stdout.decode(errors="replace")
+        interfaces: list[dict] = []
+        current_phy: str = ""
+        current: dict | None = None
+
+        for line in raw.splitlines():
+            stripped = line.strip()
+
+            if line.startswith("phy#"):
+                current_phy = line.strip()
+                continue
+
+            if stripped.startswith("Interface "):
+                if current is not None:
+                    interfaces.append(current)
+                current = {
+                    "name": stripped.split("Interface ", 1)[1].strip(),
+                    "phy": current_phy,
+                    "ifindex": 0,
+                    "addr": None,
+                    "type": None,
+                    "channel": None,
+                    "frequency": None,
+                    "ssid": None,
+                    "txpower": None,
+                }
+                continue
+
+            if current is None:
+                continue
+
+            if stripped.startswith("ifindex "):
+                try:
+                    current["ifindex"] = int(stripped.split()[1])
+                except (IndexError, ValueError):
+                    pass
+            elif stripped.startswith("addr "):
+                current["addr"] = stripped.split("addr ", 1)[1].strip()
+            elif stripped.startswith("type "):
+                current["type"] = stripped.split("type ", 1)[1].strip()
+            elif stripped.startswith("ssid "):
+                current["ssid"] = stripped.split("ssid ", 1)[1].strip()
+            elif stripped.startswith("txpower "):
+                try:
+                    current["txpower"] = float(stripped.split()[1])
+                except (IndexError, ValueError):
+                    pass
+            elif stripped.startswith("channel "):
+                # e.g. "channel 161 (5805 MHz), width: 20 MHz, center1: 5805 MHz"
+                parts = stripped.split()
+                try:
+                    current["channel"] = int(parts[1])
+                except (IndexError, ValueError):
+                    pass
+                # extract MHz value from "(5805 MHz)"
+                for part in parts:
+                    clean = part.strip("()")
+                    if clean.endswith("MHz") or clean.replace(".", "").isdigit():
+                        try:
+                            current["frequency"] = float(clean.replace("MHz", ""))
+                            break
+                        except ValueError:
+                            pass
+
+        if current is not None:
+            interfaces.append(current)
+
+        return interfaces
+
 
 # Module-level singleton
 environment_service = EnvironmentService()

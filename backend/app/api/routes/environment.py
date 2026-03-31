@@ -3,7 +3,7 @@ import json
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
-from app.schemas.environment import EnvironmentSummary, ToolCheckResponse, ToolInstallRequest
+from app.schemas.environment import EnvironmentSummary, ToolCheckResponse, ToolInstallRequest, WifiInterface
 from app.services.environment import environment_service
 
 router = APIRouter(prefix="/api/environment", tags=["environment"])
@@ -13,6 +13,17 @@ router = APIRouter(prefix="/api/environment", tags=["environment"])
 async def get_summary():
     """Quick summary: ready flag + installed counts per category."""
     return await environment_service.get_summary()
+
+
+@router.get("/interfaces", response_model=list[WifiInterface])
+async def list_interfaces():
+    """Return all wireless interfaces detected by ``iw dev``.
+
+    Each object includes: name, phy, ifindex, addr, type (managed/monitor/AP),
+    channel, frequency (MHz), ssid and txpower.
+    """
+    raw = await environment_service.list_interfaces()
+    return [WifiInterface(**iface) for iface in raw]
 
 
 @router.get("/check", response_model=list[ToolCheckResponse])

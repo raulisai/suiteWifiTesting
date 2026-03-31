@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { environmentApi, type EnvironmentSummary } from '../../api/environment'
+import { InterfaceSelector } from '../InterfaceSelector'
 
 export function TopBar() {
   const [summary, setSummary] = useState<EnvironmentSummary | null>(null)
@@ -17,6 +18,7 @@ export function TopBar() {
       <span className="text-sm text-gray-500 font-mono">WiFi Pentesting Suite</span>
 
       <div className="flex items-center gap-4 text-xs font-mono">
+        <InterfaceSelector compact />
         {summary ? (
           <>
             <span

@@ -59,14 +59,22 @@ async def scan_stream(websocket: WebSocket, db: AsyncSession = Depends(get_sessi
     await websocket.accept()
     await websocket.send_text(json.dumps({"type": "ready", "message": "Escáner listo"}))
 
+    # ── Receive config from client ────────────────────────────────────────────
     try:
         raw = await websocket.receive_text()
         config = NetworkScanRequest(**json.loads(raw))
+    except WebSocketDisconnect:
+        # Client navigated away before sending config — nothing to do.
+        return
     except Exception as exc:
-        await websocket.send_text(json.dumps({"type": "error", "message": str(exc)}))
-        await websocket.close()
+        try:
+            await websocket.send_text(json.dumps({"type": "error", "message": str(exc)}))
+            await websocket.close()
+        except Exception:
+            pass
         return
 
+    # ── Run scan and stream results ───────────────────────────────────────────
     try:
         async for net_data in scanner_service.scan_stream(config.interface, config.duration):
             # Persist to DB in real time
@@ -87,6 +95,16 @@ async def scan_stream(websocket: WebSocket, db: AsyncSession = Depends(get_sessi
 
         await websocket.send_text(json.dumps({"type": "done", "message": "Escaneo completado."}))
     except WebSocketDisconnect:
+        # Client disconnected mid-scan — terminate gracefully.
         pass
+    except Exception as exc:
+        # airodump-ng not found, interface error, permission denied, etc.
+        try:
+            await websocket.send_text(json.dumps({"type": "error", "message": str(exc)}))
+        except Exception:
+            pass
     finally:
-        await websocket.close()
+        try:
+            await websocket.close()
+        except Exception:
+            pass

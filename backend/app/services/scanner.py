@@ -100,14 +100,20 @@ class ScannerService:
         work_dir = tempfile.mkdtemp(prefix="wifi_suite_scan_")
         prefix = os.path.join(work_dir, "scan")
 
-        proc = await asyncio.create_subprocess_exec(
-            "airodump-ng",
-            "--output-format", "csv",
-            "-w", prefix,
-            interface,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "airodump-ng",
+                "--output-format", "csv",
+                "-w", prefix,
+                interface,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                "airodump-ng no está instalado. "
+                "Ejecuta: sudo apt install aircrack-ng"
+            )
 
         seen_bssids: set[str] = set()
         csv_path = f"{prefix}-01.csv"
@@ -117,6 +123,24 @@ class ScannerService:
             while elapsed < duration:
                 await asyncio.sleep(5)
                 elapsed += 5
+
+                # Detect early exit (bad interface, no permissions, etc.)
+                if proc.returncode is not None and proc.returncode != 0:
+                    stderr_bytes = b""
+                    if proc.stderr:
+                        try:
+                            stderr_bytes = await asyncio.wait_for(
+                                proc.stderr.read(), timeout=1
+                            )
+                        except asyncio.TimeoutError:
+                            pass
+                    msg = stderr_bytes.decode(errors="replace").strip()
+                    raise RuntimeError(
+                        f"airodump-ng salió con código {proc.returncode}"
+                        + (f": {msg}" if msg else
+                           ". Comprueba que la interfaz esté en modo monitor "
+                           "y que el proceso corra como root.")
+                    )
 
                 if not os.path.exists(csv_path):
                     continue

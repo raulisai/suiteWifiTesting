@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { WSEvent } from '../types/attack'
 import { wsUrl } from '../api/client'
+import { toast } from '../store/toasts'
 
 type WSStatus = 'idle' | 'connecting' | 'ready' | 'running' | 'done' | 'error' | 'closed'
 
@@ -66,9 +67,14 @@ export function useWebSocket({
           break
         case 'done':
           setStatus('done')
+          toast.success('Completado', event.message || 'Operación finalizada.')
           break
         case 'error':
           setStatus('error')
+          toast.error('Error', event.message || 'Ocurrió un error en la operación.')
+          break
+        case 'warning':
+          toast.warning('Advertencia', event.message)
           break
         default:
           break
@@ -79,6 +85,7 @@ export function useWebSocket({
 
     ws.onerror = () => {
       setStatus('error')
+      toast.error('WebSocket desconectado', `No se pudo conectar a ${path}.`)
     }
 
     ws.onclose = () => {
