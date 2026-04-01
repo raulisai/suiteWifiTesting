@@ -3,6 +3,7 @@ export interface Credential {
   network_id: number
   bssid: string
   ssid: string | null
+  password: string
   wps_pin: string | null
   attack_type: string
   cracked_by: string

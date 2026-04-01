@@ -8,8 +8,9 @@ class HandshakeAttackRequest(BaseModel):
     bssid: str
     channel: int
     client_mac: str | None = None  # targeted deauth; None = broadcast
-    deauth_count: int = 10
+    deauth_count: int = 64          # increased for better client disconnection
     capture_timeout: int = 300
+    max_retries: int = 5            # attempt up to N times before giving up
 
 
 class WpsAttackRequest(BaseModel):

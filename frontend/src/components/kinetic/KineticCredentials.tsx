@@ -252,9 +252,9 @@ export function KineticCredentials() {
               <thead className="sticky top-0 bg-[#080c10]">
                 <tr className="border-b border-[#1a2f1a] text-[#2aff8a]/30">
                   <th className="text-left py-2 px-3 tracking-wider">NETWORK</th>
+                  <th className="text-left py-2 px-3 tracking-wider">PASSWORD</th>
                   <th className="text-left py-2 px-3 tracking-wider">TYPE</th>
                   <th className="text-left py-2 px-3 tracking-wider">CRACKER</th>
-                  <th className="text-left py-2 px-3 tracking-wider">WPS PIN</th>
                   <th className="text-left py-2 px-3 tracking-wider">FOUND</th>
                   <th className="text-left py-2 px-3"></th>
                 </tr>
@@ -267,18 +267,31 @@ export function KineticCredentials() {
                       <div className="text-[#2aff8a]/30 text-[9px] mt-0.5">{c.bssid}</div>
                     </td>
                     <td className="py-2.5 px-3">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[#2aff8a] font-bold text-[11px] bg-[#2aff8a]/10 px-2 py-1 rounded border border-[#2aff8a]/30 select-all">
+                          {c.password}
+                        </span>
+                        <button
+                          onClick={() => handleCopy(c.password)}
+                          className="px-1.5 py-0.5 rounded border border-[#2aff8a]/20 text-[#2aff8a]/40 hover:text-[#2aff8a] hover:border-[#2aff8a]/50 text-[8px] transition-colors"
+                          title="Copy password"
+                        >
+                          COPY
+                        </button>
+                      </div>
+                      {c.wps_pin && (
+                        <div className="text-[#ff6b35]/50 text-[8px] mt-1">PIN: {c.wps_pin}</div>
+                      )}
+                    </td>
+                    <td className="py-2.5 px-3">
                       <span className={`px-2 py-0.5 rounded border text-[9px] font-bold ${ATTACK_BADGE[c.attack_type] ?? 'border-[#2aff8a]/20 text-[#2aff8a]/40'}`}>
                         {c.attack_type.toUpperCase()}
                       </span>
                     </td>
                     <td className="py-2.5 px-3 text-[#2aff8a]/50">{c.cracked_by}</td>
-                    <td className="py-2.5 px-3 text-[#2aff8a]/50">{c.wps_pin ?? '—'}</td>
                     <td className="py-2.5 px-3 text-[#2aff8a]/30">{new Date(c.found_at).toLocaleString()}</td>
                     <td className="py-2.5 px-3">
-                      <div className="flex gap-1.5">
-                        <button onClick={() => handleCopy(c.bssid)} className="px-2 py-0.5 rounded border border-[#2aff8a]/20 text-[#2aff8a]/40 hover:text-[#2aff8a] hover:border-[#2aff8a]/50 text-[9px] transition-colors">COPY</button>
-                        <button onClick={() => deleteCredential(c.id)} className="px-2 py-0.5 rounded border border-[#ff4444]/20 text-[#ff4444]/40 hover:text-[#ff4444] hover:border-[#ff4444]/50 text-[9px] transition-colors">DEL</button>
-                      </div>
+                      <button onClick={() => deleteCredential(c.id)} className="px-2 py-0.5 rounded border border-[#ff4444]/20 text-[#ff4444]/40 hover:text-[#ff4444] hover:border-[#ff4444]/50 text-[9px] transition-colors">DEL</button>
                     </td>
                   </tr>
                 ))}

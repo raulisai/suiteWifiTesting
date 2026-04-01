@@ -77,6 +77,7 @@ async def handshake_attack(
             client_mac=req.client_mac,
             deauth_count=req.deauth_count,
             timeout=req.capture_timeout,
+            max_retries=req.max_retries,
         ):
             await websocket.send_text(json.dumps(event))
     except WebSocketDisconnect:
@@ -86,7 +87,10 @@ async def handshake_attack(
 
 
 @router.websocket("/wps")
-async def wps_attack(websocket: WebSocket):
+async def wps_attack(
+    websocket: WebSocket,
+    db: AsyncSession = Depends(get_session),
+):
     """WPS Pixie Dust or brute-force attack with live terminal output."""
     await websocket.accept()
     await websocket.send_text(json.dumps({"type": "ready", "message": "Listo para ataque WPS"}))
@@ -101,6 +105,7 @@ async def wps_attack(websocket: WebSocket):
 
     try:
         async for event in attacker_service.attack_wps(
+            db=db,
             interface=req.interface,
             bssid=req.bssid,
             channel=req.channel,

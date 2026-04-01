@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import type { Network } from '../../types/network'
 import { useCredentialsStore } from '../../store/credentials'
+import { credentialsApi } from '../../api/credentials'
+import { wsUrl } from '../../api/client'
+import { useWebSocket } from '../../hooks/useWebSocket'
+import { useInterfacesStore } from '../../store/interfaces'
 import {
   FILTER_DEFS,
   type MapFilter,
@@ -258,14 +262,47 @@ function NetworkDetailPanel({
 }
 
 // ── AttackAnimation ───────────────────────────────────────────────────────────
+type AnimScene  = 'capture' | 'transfer' | 'decrypt'
+type CrackState = 'idle' | 'cracking' | 'found' | 'failed'
+
 function AttackAnimation({ network, onFinish, onHandoff }: {
   network: Network; onFinish: () => void; onHandoff: (n: Network) => void
 }) {
+  // ── capture phase state ───────────────────────────────────────────────────
   const [phase, setPhase]         = useState(0)
   const [pkts,  setPkts]          = useState<{ id: number; x: number; y: number; tx: number; ty: number; p: number; type: 'deauth'|'hs' }[]>([])
   const [gone,  setGone]          = useState<number[]>([])
   const pktId   = useRef(0)
   const clients = simulatedClients(network.bssid).slice(0, 4)
+
+  // ── scene / decrypt state ─────────────────────────────────────────────────
+  const [scene,         setScene]         = useState<AnimScene>('capture')
+  const [xferTick,      setXferTick]      = useState(0)
+  const [handshake,     setHandshake]     = useState<import('../../types/credential').Handshake | null>(null)
+  const [wordlists,     setWordlists]     = useState<{ name: string; path: string; size_mb: number }[]>([])
+  const [wlLoading,     setWlLoading]     = useState(false)
+  const [wlTab,         setWlTab]         = useState<'server' | 'custom'>('server')
+  const [selectedWl,    setSelectedWl]    = useState<string | null>(null)
+  const [customPath,    setCustomPath]    = useState('')
+  const [useHashcat,    setUseHashcat]    = useState(false)
+  const [crackState,    setCrackState]    = useState<CrackState>('idle')
+  const [crackLogs,     setCrackLogs]     = useState<string[]>([])
+  const [crackProgress, setCrackProgress] = useState(0)
+  const [foundPwd,      setFoundPwd]      = useState<string | null>(null)
+  const logsEndRef    = useRef<HTMLDivElement>(null)
+  const crackStateRef = useRef<CrackState>('idle')
+  crackStateRef.current = crackState
+
+  // ── capture WS state — real backend attack ────────────────────────────────
+  const selectedInterface                     = useInterfacesStore(s => s.selected)
+  const [wsAttempt,      setWsAttempt]        = useState(1)
+  const [wsMaxAttempts,  setWsMaxAttempts]    = useState(5)
+  const [wsLogs,         setWsLogs]           = useState<string[]>([])
+  const [captureFailed,  setCaptureFailed]    = useState(false)
+  const [captureFailMsg, setCaptureFailMsg]   = useState('')
+  const captureWsRef                          = useRef<WebSocket | null>(null)
+  const wsLogsEndRef                          = useRef<HTMLDivElement>(null)
+  const prevAttemptRef                        = useRef(1)
 
   useEffect(() => {
     if (phase >= PHASES.length - 1) return
@@ -312,11 +349,503 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase])
 
+  // ── connect to real backend capture WS ─────────────────────────────────────
+  useEffect(() => {
+    if (!selectedInterface || !network.channel) return
+
+    const ws = new WebSocket(wsUrl('/api/attacks/handshake'))
+    captureWsRef.current = ws
+
+    ws.onmessage = (msg: MessageEvent) => {
+      let ev: { type: string; message: string; attempt?: number; max_retries?: number; data?: Record<string,unknown> }
+      try { ev = JSON.parse(msg.data as string) } catch { return }
+
+      switch (ev.type) {
+        case 'ready':
+          ws.send(JSON.stringify({
+            interface:    selectedInterface,
+            bssid:        network.bssid,
+            channel:      network.channel,
+            deauth_count: 64,
+            max_retries:  5,
+          }))
+          break
+        case 'step':
+          setWsLogs(prev => [...prev.slice(-99), ev.message])
+          if (ev.attempt !== undefined) {
+            if (ev.attempt !== prevAttemptRef.current) {
+              prevAttemptRef.current = ev.attempt
+              setWsAttempt(ev.attempt)
+              setWsMaxAttempts(ev.max_retries ?? 5)
+            }
+          }
+          break
+        case 'output':
+        case 'warning':
+        case 'progress':
+          setWsLogs(prev => [...prev.slice(-99), ev.message])
+          break
+        case 'handshake':
+          setWsLogs(prev => [...prev.slice(-99), `✓ ${ev.message}`])
+          setPhase(PHASES.length - 1) // jump to HASH CAPTURED immediately
+          break
+        case 'error':
+          setCaptureFailed(true)
+          setCaptureFailMsg(ev.message)
+          break
+        default: break
+      }
+    }
+
+    ws.onerror = () => { captureWsRef.current = null }
+    return () => { ws.close(); captureWsRef.current = null }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [network.bssid, network.channel, selectedInterface])
+
+  // ── reset phase animation when attempt increments ─────────────────────────
+  useEffect(() => {
+    if (wsAttempt < 2) return
+    setPhase(0)
+    setGone([])
+    setPkts([])
+    pktId.current = 0
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wsAttempt])
+
+  // ── auto-scroll WS logs ───────────────────────────────────────────────────
+  useEffect(() => {
+    wsLogsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [wsLogs])
+
+  // ── auto-transition to decrypt after HASH CAPTURED ───────────────────────
+  useEffect(() => {
+    if (phase !== PHASES.length - 1) return
+
+    setWlLoading(true)
+    Promise.all([
+      credentialsApi.listHandshakes(),
+      credentialsApi.listWordlists(),
+    ]).then(([hsList, wlList]) => {
+      const hs = hsList
+        .filter(h => h.bssid.toUpperCase() === network.bssid.toUpperCase())
+        .sort((a, b) => new Date(b.captured_at).getTime() - new Date(a.captured_at).getTime())[0] ?? null
+      setHandshake(hs ?? null)
+      setWordlists(wlList)
+      setWlLoading(false)
+    }).catch(() => setWlLoading(false))
+
+    const tickIv = setInterval(() => setXferTick(t => t + 1), 350)
+    const tXfer = setTimeout(() => {
+      setScene('transfer')
+      const tDecrypt = setTimeout(() => setScene('decrypt'), 1800)
+      return () => clearTimeout(tDecrypt)
+    }, 2000)
+
+    return () => { clearTimeout(tXfer); clearInterval(tickIv) }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase])
+
+  // ── auto-scroll crack logs ────────────────────────────────────────────────
+  useEffect(() => {
+    logsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [crackLogs])
+
+  // ── WebSocket crack ───────────────────────────────────────────────────────
+  const wordlist = wlTab === 'server' ? (selectedWl ?? '') : customPath.trim()
+
+  const { connect: startCrack, disconnect: stopCrack } = useWebSocket({
+    path: '/api/attacks/crack',
+    config: { handshake_id: handshake?.id ?? 0, wordlist, use_hashcat: useHashcat },
+    onEvent: (event) => {
+      if (event.type === 'output' || event.type === 'step') {
+        setCrackLogs(prev => [...prev.slice(-149), event.message])
+      }
+      if (event.type === 'progress' && event.progress !== undefined) {
+        setCrackProgress(event.progress)
+      }
+      if (event.type === 'credential') {
+        const pwd = (event.data?.password as string) ?? event.message
+        setFoundPwd(pwd)
+        setCrackState('found')
+      }
+      if (event.type === 'done' && crackStateRef.current !== 'found') setCrackState('failed')
+      if (event.type === 'error') setCrackState('failed')
+    },
+  })
+
+  const handleStartCrack = () => {
+    setCrackState('cracking')
+    setCrackLogs([])
+    setCrackProgress(0)
+    setFoundPwd(null)
+    startCrack()
+  }
+
+  const handleRetryCrack = () => {
+    stopCrack()
+    setCrackState('idle')
+    setCrackLogs([])
+    setCrackProgress(0)
+    setFoundPwd(null)
+  }
+
   const cur = PHASES[phase]
-
-  // AP position: 88,18  clients: 10+i*52, 72  attacker: 100,135
   const clientPositions = clients.map((_, i) => ({ cx: 10 + i * 52, cy: 72 }))
+  const dots = '.'.repeat(xferTick % 4)
 
+  // ══════════════════════════════════════════════════════════════════════════
+  // SCENE: capture failed (all retries exhausted)
+  // ══════════════════════════════════════════════════════════════════════════
+  if (captureFailed) {
+    return (
+      <div className="absolute inset-0 z-30 flex flex-col items-center justify-center px-5"
+        style={{ background: 'rgba(3,6,10,0.97)', backdropFilter: 'blur(10px)' }}>
+        <button onClick={onFinish} className="absolute top-3 right-4 text-xs transition-colors"
+          style={{ color: 'rgba(255,68,68,0.30)' }}
+          onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,68,68,0.75)')}
+          onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,68,68,0.30)')}>ESC ✕</button>
+
+        <div className="text-4xl mb-3" style={{ filter: 'drop-shadow(0 0 20px #ff4444)' }}>✗</div>
+        <div className="text-[10px] font-bold tracking-[0.3em] mb-2" style={{ color: '#ff4444' }}>
+          HANDSHAKE CAPTURE FAILED
+        </div>
+        <div className="text-[8px] font-mono text-center mb-4 leading-relaxed" style={{ color: 'rgba(255,68,68,0.55)', maxWidth: 280 }}>
+          {captureFailMsg}
+        </div>
+
+        {/* diagnostic log */}
+        {wsLogs.length > 0 && (
+          <div className="w-full rounded p-2.5 mb-4 max-h-40 overflow-y-auto font-mono text-[8px] space-y-0.5"
+            style={{ background: 'rgba(255,68,68,0.04)', border: '1px solid rgba(255,68,68,0.15)' }}>
+            {wsLogs.slice(-20).map((l, i) => (
+              <div key={i} style={{ color: l.startsWith('✗') ? '#ff4444' : 'rgba(255,68,68,0.45)' }}>{l}</div>
+            ))}
+          </div>
+        )}
+
+        <div className="text-[8px] font-bold tracking-wider mb-3" style={{ color: 'rgba(255,68,68,0.35)' }}>
+          CHECKLIST
+        </div>
+        <div className="space-y-1.5 mb-5 w-full" style={{ maxWidth: 280 }}>
+          {[
+            ['airmon-ng start wlanX', 'Interfaz en modo monitor'],
+            ['Clientes activos', 'Dispositivos conectados al AP'],
+            ['Canal correcto', `CH ${network.channel ?? '?'} — usa -c ${network.channel ?? '?'}`],
+            ['Proximidad al AP', 'Acércate para mejor señal'],
+          ].map(([cmd, label]) => (
+            <div key={cmd} className="flex items-center gap-2 text-[8px]">
+              <span style={{ color: 'rgba(255,68,68,0.40)' }}>○</span>
+              <span style={{ color: 'rgba(255,68,68,0.60)' }}>{label}</span>
+              <span className="ml-auto font-mono" style={{ color: 'rgba(255,68,68,0.28)' }}>{cmd}</span>
+            </div>
+          ))}
+        </div>
+
+        <div className="flex gap-2 w-full" style={{ maxWidth: 280 }}>
+          <button onClick={() => { setCaptureFailed(false); setPhase(0); setWsAttempt(1); setWsLogs([]); prevAttemptRef.current = 1 }}
+            className="flex-1 py-2 rounded font-bold text-[9px] tracking-widest transition-all"
+            style={{ background: 'rgba(42,255,138,0.07)', border: '1px solid rgba(42,255,138,0.20)', color: 'rgba(42,255,138,0.55)' }}
+            onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.background = 'rgba(42,255,138,0.14)')}
+            onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.background = 'rgba(42,255,138,0.07)')}>
+            ↺ REINTENTAR
+          </button>
+          <button onClick={() => { onHandoff(network); onFinish() }}
+            className="flex-1 py-2 rounded font-bold text-[9px] tracking-widest transition-all"
+            style={{ background: 'rgba(255,68,68,0.08)', border: '1px solid rgba(255,68,68,0.22)', color: 'rgba(255,110,110,0.80)' }}
+            onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,68,68,0.16)')}
+            onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,68,68,0.08)')}>
+            → CONSOLA
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // SCENE: transfer — animated beam from capture to decrypt
+  // ══════════════════════════════════════════════════════════════════════════
+  if (scene === 'transfer') {
+    return (
+      <div className="absolute inset-0 z-30 flex flex-col items-center justify-center"
+        style={{ background: 'rgba(3,6,10,0.97)', backdropFilter: 'blur(10px)' }}>
+        <button onClick={onFinish} className="absolute top-3 right-4 text-xs transition-colors"
+          style={{ color: 'rgba(42,255,138,0.22)' }}
+          onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(42,255,138,0.70)')}
+          onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(42,255,138,0.22)')}>ESC ✕</button>
+
+        <div className="flex flex-col items-center gap-4 px-6 text-center">
+          <div className="text-5xl" style={{ color: SG, filter: `drop-shadow(0 0 28px ${SG})` }}>◈</div>
+          <div className="text-[13px] font-bold tracking-[0.35em]" style={{ color: SG }}>HASH CAPTURED</div>
+          <div className="text-[9px] font-mono" style={{ color: 'rgba(42,255,138,0.35)' }}>{network.ssid ?? network.bssid}</div>
+          {wsAttempt > 1 && (
+            <div className="text-[8px] font-mono" style={{ color: 'rgba(42,255,138,0.28)' }}>
+              Capturado en intento {wsAttempt}/{wsMaxAttempts}
+            </div>
+          )}
+
+          <div className="flex items-center gap-2 mt-2">
+            <div className="text-[10px] font-mono" style={{ color: 'rgba(42,255,138,0.30)' }}>HASH</div>
+            <div className="flex gap-1.5">
+              {[0,1,2,3,4,5,6,7].map(i => (
+                <div key={i} style={{
+                  width: 7, height: 7, borderRadius: '50%',
+                  background: i === (xferTick % 8) ? '#00e5ff'
+                    : i < (xferTick % 8) ? 'rgba(0,229,255,0.22)'
+                    : 'rgba(0,229,255,0.06)',
+                  boxShadow: i === (xferTick % 8) ? '0 0 10px #00e5ff' : 'none',
+                  transition: 'all 0.2s',
+                }} />
+              ))}
+            </div>
+            <div className="text-[10px] font-mono" style={{ color: '#00e5ff' }}>DECRYPT</div>
+          </div>
+          <div className="text-[10px] font-mono tracking-widest mt-1" style={{ color: '#00e5ff' }}>
+            ROUTING TO DECRYPT ENGINE{dots}
+          </div>
+
+          <div className="mt-3 rounded-lg px-4 py-3 text-left space-y-1" style={{
+            background: 'rgba(42,255,138,0.04)', border: '1px solid rgba(42,255,138,0.08)', minWidth: 220,
+          }}>
+            {PHASES.map(p => (
+              <div key={p.id} className="flex items-center gap-2 text-[8px] font-mono">
+                <span style={{ color: SG }}>✓</span>
+                <span style={{ color: 'rgba(42,255,138,0.55)' }}>{p.label}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // SCENE: decrypt — crack engine
+  // ══════════════════════════════════════════════════════════════════════════
+  if (scene === 'decrypt') {
+    return (
+      <div className="absolute inset-0 z-30 flex flex-col"
+        style={{ background: 'rgba(3,6,10,0.97)', backdropFilter: 'blur(10px)' }}>
+        <button onClick={onFinish} className="absolute top-3 right-4 z-10 text-xs transition-colors"
+          style={{ color: 'rgba(42,255,138,0.22)' }}
+          onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(42,255,138,0.70)')}
+          onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(42,255,138,0.22)')}>ESC ✕</button>
+
+        <div className="flex flex-col items-center pt-5 pb-3 shrink-0" style={{ borderBottom: '1px solid rgba(42,255,138,0.07)' }}>
+          <div className="flex items-center gap-2.5">
+            <span className="text-xl" style={{ color: SG, filter: `drop-shadow(0 0 10px ${SG})` }}>◈</span>
+            <span className="text-[11px] font-bold tracking-[0.3em]" style={{ color: SG }}>DECRYPT ENGINE</span>
+          </div>
+          <div className="flex items-center gap-1 mt-1.5">
+            {PHASES.map(p => (
+              <div key={p.id} className="rounded-full" style={{ width: 14, height: 4, background: SG, boxShadow: `0 0 5px ${SG}` }} />
+            ))}
+          </div>
+          <div className="text-[8px] font-mono mt-1" style={{ color: 'rgba(42,255,138,0.25)' }}>{network.ssid ?? network.bssid}</div>
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
+          {/* Handshake card */}
+          {handshake ? (
+            <div className="rounded-lg p-3" style={{ background: 'rgba(0,229,255,0.04)', border: '1px solid rgba(0,229,255,0.18)' }}>
+              <div className="flex items-center gap-2 mb-2">
+                <span style={{ color: '#00e5ff', fontSize: 12 }}>⬟</span>
+                <span className="text-[8px] font-bold tracking-[0.2em]" style={{ color: '#00e5ff' }}>HANDSHAKE ON FILE</span>
+                <span className="ml-auto text-[7px] font-mono" style={{ color: 'rgba(0,229,255,0.35)' }}>#{handshake.id}</span>
+              </div>
+              <div className="space-y-1">
+                {([
+                  ['BSSID',  network.bssid],
+                  ['SSID',   network.ssid ?? '(hidden)'],
+                  ['FILE',   handshake.file_path.split('/').pop() ?? ''],
+                  ['STATUS', handshake.verified ? '◈ VERIFIED' : '○ UNVERIFIED'],
+                ] as [string, string][]).map(([k, v]) => (
+                  <div key={k} className="flex gap-2 text-[8px]">
+                    <span className="w-12 shrink-0 tracking-wider" style={{ color: 'rgba(0,229,255,0.28)' }}>{k}</span>
+                    <span className="font-mono truncate" style={{
+                      color: k === 'STATUS' ? (handshake.verified ? SG : '#ff8800') : 'rgba(0,229,255,0.65)',
+                    }}>{v}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="rounded-lg p-3 text-center" style={{ background: 'rgba(255,136,0,0.05)', border: '1px solid rgba(255,136,0,0.18)' }}>
+              <div className="text-[9px] font-bold tracking-wider" style={{ color: '#ff8800' }}>
+                {wlLoading ? 'BUSCANDO HANDSHAKES…' : 'SIN HANDSHAKE PARA ESTE BSSID'}
+              </div>
+              <div className="text-[8px] mt-1" style={{ color: 'rgba(255,136,0,0.40)' }}>
+                Ejecuta una captura real desde la consola
+              </div>
+            </div>
+          )}
+
+          {/* Dictionary selector */}
+          {handshake && crackState === 'idle' && (
+            <div className="rounded-lg overflow-hidden" style={{ border: '1px solid rgba(42,255,138,0.10)' }}>
+              <div className="px-3 py-2" style={{ background: 'rgba(42,255,138,0.04)', borderBottom: '1px solid rgba(42,255,138,0.07)' }}>
+                <span className="text-[8px] font-bold tracking-[0.22em]" style={{ color: 'rgba(42,255,138,0.60)' }}>CRACK ENGINE // DICCIONARIO</span>
+              </div>
+              <div className="flex" style={{ borderBottom: '1px solid rgba(42,255,138,0.07)' }}>
+                {(['server', 'custom'] as const).map(t => (
+                  <button key={t} onClick={() => setWlTab(t)}
+                    className="flex-1 py-1.5 text-[8px] tracking-widest font-bold transition-all"
+                    style={{
+                      color:        wlTab === t ? SG : 'rgba(42,255,138,0.25)',
+                      background:   wlTab === t ? 'rgba(42,255,138,0.06)' : 'transparent',
+                      borderBottom: wlTab === t ? `1px solid ${SG}` : '1px solid transparent',
+                    }}>
+                    {t === 'server' ? '📂  SERVIDOR' : '✏  RUTA CUSTOM'}
+                  </button>
+                ))}
+              </div>
+              <div className="p-3">
+                {wlTab === 'server' && (
+                  <div className="space-y-1.5 max-h-40 overflow-y-auto">
+                    {wlLoading && <div className="text-[8px] text-center py-4 animate-pulse" style={{ color: 'rgba(42,255,138,0.30)' }}>ESCANEANDO…</div>}
+                    {!wlLoading && wordlists.length === 0 && (
+                      <div className="text-[8px] text-center py-4" style={{ color: 'rgba(42,255,138,0.18)' }}>
+                        SIN DICCIONARIOS<br/><span style={{ fontSize: 7 }}>Coloca archivos .txt/.lst en el directorio wordlists</span>
+                      </div>
+                    )}
+                    {wordlists.map(wl => (
+                      <button key={wl.path} onClick={() => setSelectedWl(wl.path)}
+                        className="w-full flex items-center justify-between px-2 py-1.5 rounded text-left transition-all"
+                        style={{
+                          background: selectedWl === wl.path ? 'rgba(42,255,138,0.09)' : 'rgba(42,255,138,0.02)',
+                          border: `1px solid ${selectedWl === wl.path ? 'rgba(42,255,138,0.28)' : 'rgba(42,255,138,0.07)'}`,
+                        }}>
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span style={{ color: selectedWl === wl.path ? SG : 'rgba(42,255,138,0.22)', fontSize: 9 }}>
+                            {selectedWl === wl.path ? '●' : '○'}
+                          </span>
+                          <span className="text-[8px] font-mono truncate" style={{ color: selectedWl === wl.path ? SG : 'rgba(42,255,138,0.55)' }}>
+                            {wl.name}
+                          </span>
+                        </div>
+                        <span className="text-[7px] shrink-0 ml-2" style={{ color: 'rgba(42,255,138,0.28)' }}>{wl.size_mb} MB</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {wlTab === 'custom' && (
+                  <div className="space-y-2">
+                    <div className="text-[8px] tracking-wider" style={{ color: 'rgba(42,255,138,0.28)' }}>RUTA EN EL SERVIDOR:</div>
+                    <input type="text" value={customPath} onChange={e => setCustomPath(e.target.value)}
+                      placeholder="/usr/share/wordlists/rockyou.txt"
+                      className="w-full bg-transparent outline-none font-mono text-[9px]"
+                      style={{ color: SG, border: '1px solid rgba(42,255,138,0.20)', borderRadius: 4, padding: '6px 10px', background: 'rgba(0,0,0,0.30)' }}
+                    />
+                  </div>
+                )}
+                <button onClick={() => setUseHashcat(v => !v)} className="flex items-center gap-2 mt-2.5 pt-2 w-full"
+                  style={{ borderTop: '1px solid rgba(42,255,138,0.06)' }}>
+                  <span style={{ color: useHashcat ? '#ff8800' : 'rgba(42,255,138,0.22)', fontSize: 10 }}>{useHashcat ? '◈' : '○'}</span>
+                  <span className="text-[8px] tracking-wider" style={{ color: useHashcat ? '#ff8800' : 'rgba(42,255,138,0.30)' }}>GPU ACCELERATION (HASHCAT)</span>
+                </button>
+              </div>
+              <div className="px-3 pb-3">
+                <button disabled={!wordlist} onClick={handleStartCrack}
+                  className="w-full py-2 rounded font-bold text-[9px] tracking-[0.22em] transition-all"
+                  style={{
+                    background: wordlist ? 'rgba(42,255,138,0.10)' : 'rgba(255,255,255,0.02)',
+                    border: `1px solid ${wordlist ? 'rgba(42,255,138,0.35)' : 'rgba(255,255,255,0.05)'}`,
+                    color: wordlist ? SG : 'rgba(42,255,138,0.15)', cursor: wordlist ? 'pointer' : 'not-allowed',
+                  }}
+                  onMouseEnter={e => { if (wordlist) (e.currentTarget as HTMLButtonElement).style.background = 'rgba(42,255,138,0.18)' }}
+                  onMouseLeave={e => { if (wordlist) (e.currentTarget as HTMLButtonElement).style.background = 'rgba(42,255,138,0.10)' }}>
+                  {wordlist ? '▶ INICIAR CRACK' : 'SELECCIONA UN DICCIONARIO'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Cracking progress */}
+          {crackState === 'cracking' && (
+            <div className="rounded-lg overflow-hidden" style={{ border: '1px solid rgba(0,229,255,0.18)' }}>
+              <div className="px-3 py-2 flex items-center gap-2"
+                style={{ background: 'rgba(0,229,255,0.05)', borderBottom: '1px solid rgba(0,229,255,0.09)' }}>
+                <span className="animate-pulse" style={{ color: '#00e5ff', fontSize: 10 }}>⚙</span>
+                <span className="text-[8px] font-bold tracking-[0.2em]" style={{ color: '#00e5ff' }}>CRACKING{dots}</span>
+                <span className="ml-auto text-[8px] font-mono" style={{ color: 'rgba(0,229,255,0.40)' }}>{crackProgress}%</span>
+              </div>
+              <div className="h-0.5" style={{ background: 'rgba(0,229,255,0.08)' }}>
+                <div className="h-full transition-all duration-500"
+                  style={{ width: `${crackProgress}%`, background: '#00e5ff', boxShadow: '0 0 6px #00e5ff' }} />
+              </div>
+              <div className="p-2 h-32 overflow-y-auto font-mono text-[8px] space-y-0.5" style={{ background: 'rgba(0,0,0,0.40)' }}>
+                {crackLogs.length === 0 && <span className="animate-pulse" style={{ color: 'rgba(0,229,255,0.30)' }}>CONECTANDO…</span>}
+                {crackLogs.map((line, i) => <div key={i} style={{ color: 'rgba(0,229,255,0.65)' }}>{line}</div>)}
+                <div ref={logsEndRef} />
+              </div>
+              <div className="px-3 py-2">
+                <button onClick={handleRetryCrack} className="text-[8px] tracking-widest transition-all"
+                  style={{ color: 'rgba(255,68,68,0.45)' }}
+                  onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,68,68,0.85)')}
+                  onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,68,68,0.45)')}>✕ ABORTAR</button>
+              </div>
+            </div>
+          )}
+
+          {/* Password found */}
+          {crackState === 'found' && foundPwd && (
+            <div className="rounded-lg p-4 text-center space-y-2" style={{
+              background: 'rgba(42,255,138,0.07)', border: `1px solid ${SG_RGBA}0.35)`, boxShadow: `0 0 32px ${SG_RGBA}0.12)`,
+            }}>
+              <div className="text-3xl" style={{ filter: `drop-shadow(0 0 16px ${SG})` }}>🏆</div>
+              <div className="text-[10px] font-bold tracking-[0.3em]" style={{ color: SG }}>PASSWORD CRACKED</div>
+              <div className="font-mono text-[15px] font-bold px-4 py-2.5 rounded select-all"
+                style={{ color: '#fff', background: 'rgba(0,0,0,0.45)', border: `1px solid ${SG_RGBA}0.30)`, letterSpacing: '0.06em' }}>
+                {foundPwd}
+              </div>
+              <div className="text-[7px] tracking-widest" style={{ color: 'rgba(42,255,138,0.35)' }}>◈ SAVED TO CREDENTIALS</div>
+              <button onClick={handleRetryCrack} className="text-[8px] mt-1 tracking-widest transition-all"
+                style={{ color: 'rgba(42,255,138,0.28)' }}
+                onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(42,255,138,0.70)')}
+                onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(42,255,138,0.28)')}>↺ OTRO DICCIONARIO</button>
+            </div>
+          )}
+
+          {/* Crack failed */}
+          {crackState === 'failed' && (
+            <div className="rounded-lg p-3 text-center space-y-2" style={{
+              background: 'rgba(255,68,68,0.04)', border: '1px solid rgba(255,68,68,0.20)',
+            }}>
+              <div className="text-[9px] font-bold tracking-[0.2em]" style={{ color: '#ff4444' }}>CONTRASEÑA NO ENCONTRADA</div>
+              <div className="text-[8px]" style={{ color: 'rgba(255,68,68,0.40)' }}>Diccionario agotado — prueba con otro.</div>
+              <button onClick={handleRetryCrack}
+                className="w-full py-1.5 rounded font-bold text-[8px] tracking-widest transition-all mt-1"
+                style={{ background: 'rgba(42,255,138,0.07)', border: '1px solid rgba(42,255,138,0.20)', color: 'rgba(42,255,138,0.55)' }}
+                onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.background = 'rgba(42,255,138,0.14)')}
+                onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.background = 'rgba(42,255,138,0.07)')}>
+                ↺ OTRO DICCIONARIO
+              </button>
+            </div>
+          )}
+        </div>
+
+        <div className="mx-4 mb-4 flex gap-2 shrink-0 pt-3" style={{ borderTop: '1px solid rgba(42,255,138,0.07)' }}>
+          <button onClick={() => { onHandoff(network); onFinish() }}
+            className="flex-1 py-2 rounded font-bold text-[9px] tracking-widest transition-all"
+            style={{ background: 'rgba(42,255,138,0.09)', border: `1px solid ${SG}50`, color: SG }}
+            onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.background = 'rgba(42,255,138,0.18)')}
+            onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.background = 'rgba(42,255,138,0.09)')}>
+            → CONSOLA COMPLETA
+          </button>
+          <button onClick={onFinish}
+            className="px-4 py-2 rounded text-[9px] tracking-widest transition-all"
+            style={{ border: '1px solid rgba(42,255,138,0.12)', color: 'rgba(42,255,138,0.35)' }}
+            onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.color = 'rgba(42,255,138,0.70)'; (e.currentTarget as HTMLButtonElement).style.borderColor = 'rgba(42,255,138,0.30)' }}
+            onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.color = 'rgba(42,255,138,0.35)'; (e.currentTarget as HTMLButtonElement).style.borderColor = 'rgba(42,255,138,0.12)' }}>
+            CLOSE
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // SCENE: capture — live topology animation
+  // ══════════════════════════════════════════════════════════════════════════
   return (
     <div className="absolute inset-0 z-30 flex flex-col" style={{ background: 'rgba(3,6,10,0.97)', backdropFilter: 'blur(10px)' }}>
 
@@ -326,8 +855,17 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
         ESC ✕
       </button>
 
-      {/* phase header */}
-      <div className="flex flex-col items-center pt-5 pb-2 shrink-0">
+      {/* header — attempt counter + phase */}
+      <div className="flex flex-col items-center pt-4 pb-2 shrink-0">
+        {wsAttempt > 1 && (
+          <div className="flex items-center gap-2 mb-2 px-3 py-1 rounded-full"
+            style={{ background: 'rgba(255,136,0,0.09)', border: '1px solid rgba(255,136,0,0.22)' }}>
+            <span className="text-[8px] font-bold tracking-widest" style={{ color: '#ff8800' }}>
+              INTENTO {wsAttempt}/{wsMaxAttempts}
+            </span>
+            <span className="text-[8px] animate-pulse" style={{ color: '#ff8800' }}>●</span>
+          </div>
+        )}
         <span className="text-3xl mb-1.5 transition-all" style={{ color: cur.color, filter: `drop-shadow(0 0 14px ${cur.color})` }}>{cur.icon}</span>
         <span className="text-[11px] font-bold tracking-[0.3em]" style={{ color: cur.color }}>{cur.label}</span>
         <span className="text-[9px] font-mono mt-1" style={{ color: 'rgba(42,255,138,0.22)' }}>{network.ssid ?? network.bssid}</span>
@@ -350,7 +888,6 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
           {/* AP icon */}
           <g transform="translate(88,18)">
             <rect x="-18" y="-4" width="36" height="32" rx="4" fill="rgba(42,255,138,0.05)" stroke="rgba(42,255,138,0.12)" strokeWidth="0.6"/>
-            {/* Cisco AP symbol */}
             <circle cx="0" cy="10" r="6" fill="none" stroke={SG} strokeWidth="1.2" opacity="0.8"/>
             <circle cx="0" cy="10" r="3" fill={SG} opacity="0.7"/>
             <path d="M-10,6 Q-10,-2 0,-2 Q10,-2 10,6" fill="none" stroke={SG} strokeWidth="1" opacity="0.5"/>
@@ -366,7 +903,6 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
             return (
               <g key={i} transform={`translate(${cx},${cy})`} style={{ opacity: isGone ? 0.15 : 1, transition: 'opacity 0.5s' }}>
                 <rect x="-14" y="-12" width="28" height="22" rx="3" fill="rgba(42,255,138,0.04)" stroke="rgba(42,255,138,0.09)" strokeWidth="0.6"/>
-                {/* Cisco workstation */}
                 <rect x="-8" y="-9" width="16" height="11" rx="1.5" fill="none" stroke={isGone ? '#ff4444' : SG} strokeWidth="1" opacity="0.75"/>
                 <rect x="-6" y="-7" width="12" height="7" rx="0.5" fill={isGone ? 'rgba(255,68,68,0.08)' : 'rgba(42,255,138,0.06)'}/>
                 <line x1="-4" y1="2" x2="-5" y2="6" stroke={isGone ? '#ff4444' : SG} strokeWidth="1" opacity="0.5"/>
@@ -374,7 +910,6 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
                 <line x1="-6" y1="6" x2="6" y2="6" stroke={isGone ? '#ff4444' : SG} strokeWidth="1" opacity="0.5"/>
                 <text x="0" y="14" textAnchor="middle" fontSize="4.5" fill={isGone ? 'rgba(255,68,68,0.4)' : 'rgba(42,255,138,0.30)'} fontFamily="monospace">CLI_{i+1}</text>
                 {isGone && <text x="0" y="-16" textAnchor="middle" fontSize="10" fill="#ff4444" opacity="0.9">✕</text>}
-                {/* line to AP */}
                 <line x1="0" y1="-12" x2={88-cx} y2={18-cy+4}
                   stroke={isGone ? 'rgba(255,68,68,0.12)' : 'rgba(42,255,138,0.10)'} strokeWidth="0.5" strokeDasharray="3,3"/>
               </g>
@@ -384,23 +919,18 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
           {/* Attacker icon */}
           <g transform="translate(100,140)">
             <rect x="-16" y="-14" width="32" height="26" rx="3" fill="rgba(255,68,68,0.06)" stroke="rgba(255,68,68,0.16)" strokeWidth="0.6"/>
-            {/* Cisco threat actor / antenna symbol */}
             <polygon points="0,-10 10,8 -10,8" fill="none" stroke="#ff4444" strokeWidth="1.2" opacity="0.85"/>
             <line x1="0" y1="-10" x2="0" y2="-2" stroke="#ff4444" strokeWidth="1.5" opacity="0.7"/>
             <circle cx="0" cy="-12" r="2" fill="#ff4444" opacity="0.7"/>
-            {/* wifi waves emanating */}
             <path d="M-8,-18 Q0,-22 8,-18" fill="none" stroke="#ff4444" strokeWidth="0.8" opacity="0.5"/>
             <path d="M-12,-22 Q0,-28 12,-22" fill="none" stroke="#ff4444" strokeWidth="0.6" opacity="0.3"/>
             <text x="0" y="18" textAnchor="middle" fontSize="4.5" fill="rgba(255,68,68,0.45)" fontFamily="monospace">ATTACKER</text>
           </g>
 
-          {/* attack line attacker → AP (phase ≥4) */}
           {phase >= 4 && (
-            <line x1="100" y1="126" x2="88" y2="50"
-              stroke="#00e5ff" strokeWidth="1.2" strokeDasharray="5,3" opacity="0.45"/>
+            <line x1="100" y1="126" x2="88" y2="50" stroke="#00e5ff" strokeWidth="1.2" strokeDasharray="5,3" opacity="0.45"/>
           )}
 
-          {/* animated packets */}
           {pkts.map(pk => {
             const px = pk.x + (pk.tx - pk.x) * pk.p
             const py = pk.y + (pk.ty - pk.y) * pk.p
@@ -417,35 +947,59 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
         </svg>
       </div>
 
-      {/* log */}
-      <div className="mx-4 mb-2 rounded px-3 py-2 font-mono text-[8px] leading-relaxed shrink-0" style={{
+      {/* log — real WS output or simulated phase labels */}
+      <div className="mx-4 mb-2 rounded px-2.5 py-2 font-mono text-[8px] leading-relaxed shrink-0" style={{
         background: 'rgba(0,0,0,0.35)', border: '1px solid rgba(42,255,138,0.06)', maxHeight: 68, overflow: 'hidden',
       }}>
-        {PHASES.slice(0, phase + 1).map((p, i) => (
-          <div key={p.id} style={{ color: i === phase ? p.color : 'rgba(42,255,138,0.28)' }}>
-            <span style={{ opacity: 0.35 }}>[{String(i).padStart(2,'0')}] </span>
-            {p.label}
-            {i < phase && <span style={{ color: SG }}> ✓</span>}
-            {i === phase && <span className="animate-pulse"> ▮</span>}
-          </div>
-        ))}
+        {wsLogs.length > 0 ? (
+          <>
+            {wsLogs.slice(-4).map((l, i) => (
+              <div key={i} style={{ color: l.startsWith('✗') ? '#ff4444' : l.startsWith('✓') ? SG : 'rgba(42,255,138,0.55)' }}>
+                {l}
+              </div>
+            ))}
+            <div ref={wsLogsEndRef} />
+          </>
+        ) : (
+          PHASES.slice(0, phase + 1).map((p, i) => (
+            <div key={p.id} style={{ color: i === phase ? p.color : 'rgba(42,255,138,0.28)' }}>
+              <span style={{ opacity: 0.35 }}>[{String(i).padStart(2,'0')}] </span>
+              {p.label}
+              {i < phase && <span style={{ color: SG }}> ✓</span>}
+              {i === phase && <span className="animate-pulse"> ▮</span>}
+            </div>
+          ))
+        )}
       </div>
 
-      {/* success actions */}
+      {/* footer: abort (if WS active) or loader (final phase) */}
+      {captureWsRef.current && phase < PHASES.length - 1 && (
+        <div className="mx-4 mb-3 shrink-0 flex gap-2">
+          <div className="flex-1 flex items-center gap-2 px-3 py-2 rounded"
+            style={{ background: 'rgba(42,255,138,0.04)', border: '1px solid rgba(42,255,138,0.08)' }}>
+            <span className="animate-pulse text-[9px]" style={{ color: SG }}>●</span>
+            <span className="text-[8px] tracking-wider" style={{ color: 'rgba(42,255,138,0.45)' }}>
+              {wsAttempt > 1 ? `INTENTO ${wsAttempt}/${wsMaxAttempts}` : 'ATAQUE EN CURSO'}
+            </span>
+          </div>
+          <button onClick={() => { captureWsRef.current?.close(); captureWsRef.current = null; onFinish() }}
+            className="px-3 py-2 rounded text-[8px] tracking-widest transition-all"
+            style={{ border: '1px solid rgba(255,68,68,0.22)', color: 'rgba(255,68,68,0.50)' }}
+            onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,68,68,0.90)')}
+            onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,68,68,0.50)')}>
+            ABORT
+          </button>
+        </div>
+      )}
       {phase === PHASES.length - 1 && (
-        <div className="mx-4 mb-4 flex gap-2 shrink-0">
-          <button onClick={() => { onHandoff(network); onFinish() }}
-            className="flex-1 py-2 rounded font-bold text-[10px] tracking-widest transition-all"
-            style={{ background: 'rgba(42,255,138,0.09)', border: `1px solid ${SG}50`, color: SG }}
-            onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.background = 'rgba(42,255,138,0.18)')}
-            onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.background = 'rgba(42,255,138,0.09)')}>
-            → OPEN CONSOLE
-          </button>
-          <button onClick={onFinish}
-            className="px-4 py-2 rounded text-[10px] tracking-widest transition-all"
-            style={{ border: '1px solid rgba(42,255,138,0.12)', color: 'rgba(42,255,138,0.38)' }}>
-            CLOSE
-          </button>
+        <div className="mx-4 mb-4 shrink-0">
+          <div className="flex items-center justify-center gap-2 py-2 rounded"
+            style={{ background: 'rgba(0,229,255,0.06)', border: '1px solid rgba(0,229,255,0.20)' }}>
+            <span className="animate-spin text-[9px]" style={{ color: '#00e5ff' }}>⟳</span>
+            <span className="text-[8px] tracking-[0.22em] font-bold animate-pulse" style={{ color: '#00e5ff' }}>
+              CARGANDO DECRYPT ENGINE…
+            </span>
+          </div>
         </div>
       )}
     </div>

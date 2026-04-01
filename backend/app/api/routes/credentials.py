@@ -55,6 +55,7 @@ class CredentialResponse(BaseModel):
     network_id: int
     bssid: str
     ssid: str | None
+    password: str
     wps_pin: str | None
     attack_type: str
     cracked_by: str
@@ -163,6 +164,7 @@ async def list_credentials(db: AsyncSession = Depends(get_session)):
             network_id=cred.network_id,
             bssid=net.bssid,
             ssid=net.ssid,
+            password=cred.password,
             wps_pin=cred.wps_pin,
             attack_type=cred.attack_type,
             cracked_by=cred.cracked_by,
@@ -193,6 +195,7 @@ async def get_credentials_for_network(
             network_id=c.network_id,
             bssid=net.bssid,
             ssid=net.ssid,
+            password=c.password,
             wps_pin=c.wps_pin,
             attack_type=c.attack_type,
             cracked_by=c.cracked_by,
