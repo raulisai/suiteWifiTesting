@@ -67,7 +67,7 @@ export function NetworkTable({ networks, onDelete, onAttack }: NetworkTableProps
                   {onAttack && (
                     <button
                       onClick={() => onAttack(n)}
-                      className="px-2 py-0.5 rounded bg-brand-600 hover:bg-brand-500 text-white text-[10px] font-bold transition-colors"
+                      className="px-2.5 py-1 rounded bg-brand-600 hover:bg-brand-500 text-white text-xs font-bold transition-colors"
                     >
                       ATACAR
                     </button>
@@ -75,7 +75,7 @@ export function NetworkTable({ networks, onDelete, onAttack }: NetworkTableProps
                   {onDelete && (
                     <button
                       onClick={() => onDelete(n.id)}
-                      className="px-2 py-0.5 rounded bg-dark-600 hover:bg-red-900 text-gray-400 hover:text-red-300 text-[10px] transition-colors"
+                      className="px-2.5 py-1 rounded bg-dark-600 hover:bg-red-900 text-gray-400 hover:text-red-300 text-xs font-bold transition-colors"
                     >
                       DEL
                     </button>

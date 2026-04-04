@@ -27,6 +27,13 @@ class PmkidAttackRequest(BaseModel):
     timeout: int = 120
 
 
+class ScanClientsRequest(BaseModel):
+    interface: str
+    bssid: str
+    channel: int
+    duration: int = 15   # seconds to run airodump-ng for client discovery
+
+
 class CrackRequest(BaseModel):
     handshake_id: int
     wordlist: str | None = None      # override default wordlist

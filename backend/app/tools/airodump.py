@@ -127,3 +127,72 @@ class AirodumpTool(AsyncToolWrapper):
             pass
 
         return networks
+
+    def parse_clients_csv(self, path: str, bssid: str | None = None) -> list[dict]:
+        """Parse the STATION (client) section of an airodump-ng CSV file.
+
+        Args:
+            path:  Path to the CSV file written by airodump-ng.
+            bssid: If given, only return clients associated with this BSSID.
+
+        Returns:
+            List of client dicts with keys: mac, bssid, power, packets, probes, last_seen.
+        """
+        clients: list[dict] = []
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                content = f.read()
+
+            # Airodump-ng separates APs from STATIONs with a blank line.
+            # The separator can be \r\n\r\n or \n\n depending on the OS / version.
+            sep = "\r\n\r\n" if "\r\n\r\n" in content else "\n\n"
+            sections = content.strip().split(sep)
+            if len(sections) < 2:
+                return clients
+
+            station_section = sections[1]
+            reader = csv.DictReader(station_section.splitlines())
+
+            for row in reader:
+                row = {k.strip(): v.strip() for k, v in row.items() if k}
+
+                mac = row.get("Station MAC", "").strip()
+                if not mac or mac.lower() == "station mac":
+                    continue
+
+                ap_bssid = row.get("BSSID", "").strip().upper()
+                if bssid and ap_bssid != bssid.upper():
+                    continue
+
+                power_raw = row.get("Power", "").strip()
+                try:
+                    power = int(power_raw)
+                except ValueError:
+                    power = None
+
+                packets_raw = (
+                    row.get("# Packets", "") or row.get("Packets", "")
+                ).strip()
+                try:
+                    packets = int(packets_raw)
+                except ValueError:
+                    packets = 0
+
+                probes_raw = row.get("Probed ESSIDs", "").strip()
+                probes = (
+                    [p.strip() for p in probes_raw.split(",") if p.strip()]
+                    if probes_raw else []
+                )
+
+                clients.append({
+                    "mac":       mac.upper(),
+                    "bssid":     ap_bssid,
+                    "power":     power,
+                    "packets":   packets,
+                    "probes":    probes,
+                    "last_seen": row.get("Last time seen", "").strip(),
+                })
+        except Exception:
+            pass
+
+        return clients

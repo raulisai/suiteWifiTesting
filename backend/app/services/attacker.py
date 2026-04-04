@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import uuid
 import logging
 from collections.abc import AsyncIterator
@@ -33,6 +34,205 @@ DEAUTH_COUNT_PER_BURST = 64 # Packets per burst — enough to force client disco
 HANDSHAKE_POLL_INTERVAL = 3 # Seconds between handshake verification checks
 WPS_TIMEOUT_DEFAULT   = 300 # 5 minutes max for WPS attacks
 MAX_DEAUTH_ROUNDS     = 8   # Max re-deauth rounds per attempt
+CHANNEL_SET_RETRIES   = 5   # Retries for setting interface channel (increased)
+CHANNEL_SET_DELAY     = 1.0 # Delay between channel set retries (increased)
+
+
+async def _run_command(cmd: list[str], timeout: float = 5.0) -> tuple[int, str, str]:
+    """Run a command and return (returncode, stdout, stderr)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return proc.returncode or 0, stdout.decode(errors="replace"), stderr.decode(errors="replace")
+    except asyncio.TimeoutError:
+        return -1, "", "Timeout"
+    except Exception as e:
+        return -1, "", str(e)
+
+
+async def _kill_interfering_processes(interface: str) -> None:
+    """Kill processes that might be interfering with the interface."""
+    # Kill any airodump/aireplay processes using this interface
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "pkill", "-f", f"airodump.*{interface}",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=2)
+    except Exception:
+        pass
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "pkill", "-f", f"aireplay.*{interface}",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=2)
+    except Exception:
+        pass
+
+    await asyncio.sleep(0.5)
+
+
+async def _set_channel_iw(interface: str, channel: int) -> tuple[bool, str]:
+    """Try to set channel using iw command."""
+    rc, _, stderr = await _run_command(["iw", "dev", interface, "set", "channel", str(channel)])
+    if rc == 0:
+        return True, "iw"
+    return False, stderr.strip()
+
+
+async def _set_channel_iwconfig(interface: str, channel: int) -> tuple[bool, str]:
+    """Try to set channel using iwconfig command (fallback)."""
+    rc, _, stderr = await _run_command(["iwconfig", interface, "channel", str(channel)])
+    if rc == 0:
+        return True, "iwconfig"
+    return False, stderr.strip()
+
+
+async def _set_channel_with_ifdown(interface: str, channel: int) -> tuple[bool, str]:
+    """Bring interface down, set channel, bring back up."""
+    # Bring down
+    rc, _, _ = await _run_command(["ip", "link", "set", interface, "down"])
+    if rc != 0:
+        return False, "No se pudo bajar la interfaz"
+
+    await asyncio.sleep(0.3)
+
+    # Set channel while down
+    rc, _, stderr = await _run_command(["iw", "dev", interface, "set", "channel", str(channel)])
+
+    # Bring back up regardless
+    await _run_command(["ip", "link", "set", interface, "up"])
+    await asyncio.sleep(0.3)
+
+    if rc == 0:
+        return True, "ifdown+iw"
+    return False, stderr.strip()
+
+
+async def _set_interface_channel(interface: str, channel: int) -> tuple[bool, str]:
+    """Set the wireless interface to a specific channel.
+
+    Tries multiple methods in order of preference:
+    1. iw dev <interface> set channel <channel>
+    2. iwconfig <interface> channel <channel>
+    3. Bring interface down, set channel, bring back up
+
+    Returns (success, message).
+    """
+    last_error = ""
+
+    for attempt in range(CHANNEL_SET_RETRIES):
+        # Method 1: Direct iw command
+        ok, msg = await _set_channel_iw(interface, channel)
+        if ok:
+            current_ch = await _get_interface_channel(interface)
+            if current_ch == channel:
+                return True, f"Canal {channel} configurado correctamente"
+            elif current_ch is None:
+                return True, f"Canal {channel} configurado (sin verificación)"
+            # Channel didn't stick, continue to next method
+
+        last_error = msg
+
+        # Check if device is busy
+        if "busy" in msg.lower() or "resource" in msg.lower():
+            logger.info(f"Interface {interface} busy, attempt {attempt + 1}/{CHANNEL_SET_RETRIES}")
+
+            # Method 2: Try iwconfig as fallback
+            ok, msg = await _set_channel_iwconfig(interface, channel)
+            if ok:
+                current_ch = await _get_interface_channel(interface)
+                if current_ch == channel or current_ch is None:
+                    return True, f"Canal {channel} configurado (iwconfig)"
+
+            # Method 3: Bring interface down and back up
+            if attempt >= 2:  # Only try this on later attempts
+                ok, msg = await _set_channel_with_ifdown(interface, channel)
+                if ok:
+                    current_ch = await _get_interface_channel(interface)
+                    if current_ch == channel or current_ch is None:
+                        return True, f"Canal {channel} configurado (ifdown)"
+
+            await asyncio.sleep(CHANNEL_SET_DELAY)
+            continue
+
+        # Non-busy error - try iwconfig
+        ok, msg = await _set_channel_iwconfig(interface, channel)
+        if ok:
+            current_ch = await _get_interface_channel(interface)
+            if current_ch == channel or current_ch is None:
+                return True, f"Canal {channel} configurado (iwconfig)"
+
+        await asyncio.sleep(CHANNEL_SET_DELAY)
+
+    # Last resort: kill interfering processes and try once more
+    logger.warning(f"Last resort: killing interfering processes for {interface}")
+    await _kill_interfering_processes(interface)
+    await asyncio.sleep(1)
+
+    ok, msg = await _set_channel_with_ifdown(interface, channel)
+    if ok:
+        current_ch = await _get_interface_channel(interface)
+        if current_ch == channel or current_ch is None:
+            return True, f"Canal {channel} configurado (último recurso)"
+
+    return False, f"No se pudo configurar el canal {channel} después de {CHANNEL_SET_RETRIES} intentos. Último error: {last_error}"
+
+
+async def _get_interface_channel(interface: str) -> int | None:
+    """Get the current channel of the wireless interface.
+
+    Returns the channel number or None if it couldn't be determined.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "iw", "dev", interface, "info",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        output = stdout.decode(errors="replace")
+
+        # Parse "channel X" from iw output
+        match = re.search(r"channel\s+(\d+)", output, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        return None
+    except Exception as e:
+        logger.warning(f"Could not get channel for {interface}: {e}")
+        return None
+
+
+async def _verify_monitor_mode(interface: str) -> tuple[bool, str]:
+    """Verify that the interface is in monitor mode.
+
+    Returns (is_monitor, message).
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "iw", "dev", interface, "info",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        output = stdout.decode(errors="replace")
+
+        if "type monitor" in output.lower():
+            return True, "Interfaz en modo monitor"
+        elif "type managed" in output.lower():
+            return False, f"{interface} está en modo managed. Ejecuta: airmon-ng start {interface}"
+        else:
+            return False, f"No se pudo determinar el modo de {interface}"
+    except Exception as e:
+        return False, f"Error verificando modo monitor: {e}"
 
 
 class AttackerService:
@@ -159,6 +359,13 @@ class AttackerService:
             "tool": "airodump-ng",
         }
 
+        # ── Verify monitor mode ──────────────────────────────────────────────
+        is_monitor, monitor_msg = await _verify_monitor_mode(interface)
+        if not is_monitor:
+            yield {"type": "error", "message": monitor_msg}
+            return
+        yield {"type": "step", "message": f"✓ {monitor_msg}"}
+
         for attempt in range(1, max_retries + 1):
             yield {
                 "type": "step",
@@ -166,6 +373,23 @@ class AttackerService:
                 "attempt": attempt,
                 "max_retries": max_retries,
             }
+
+            # ── Set interface to target channel BEFORE capture ────────────────
+            yield {"type": "step", "message": f"Configurando canal {channel} en {interface}..."}
+            ch_ok, ch_msg = await _set_interface_channel(interface, channel)
+            if not ch_ok:
+                # Don't fail immediately - airodump-ng will try to set channel with -c flag
+                yield {"type": "warning", "message": f"⚠ {ch_msg}. Intentando continuar..."}
+            else:
+                yield {"type": "step", "message": f"✓ {ch_msg}"}
+
+            # Verify channel is correct
+            current_ch = await _get_interface_channel(interface)
+            if current_ch is not None and current_ch != channel:
+                yield {
+                    "type": "warning",
+                    "message": f"⚠ Canal actual ({current_ch}) difiere del objetivo ({channel}). Airodump configurará -c {channel}.",
+                }
 
             cap_dir       = os.path.join(cap_base, f"attempt_{attempt}")
             os.makedirs(cap_dir, exist_ok=True)
@@ -288,10 +512,40 @@ class AttackerService:
 
             # ── Diagnose why this attempt failed ─────────────────────────────
             reasons: list[str] = []
-            if not os.path.exists(cap_file):
-                reasons.append(
-                    "no se creó el cap file — verifica modo monitor (airmon-ng start wlanX)"
+            channel_issue_detected = False
+
+            if os.path.exists(log_path):
+                with open(log_path) as fh:
+                    log_content = fh.read()
+                log_tail = log_content[-1500:]
+
+                # Check for channel mismatch — CRITICAL issue
+                ch_mismatch = re.search(
+                    r"(\w+)\s+is on channel\s+(\d+),?\s+but the AP uses channel\s+(\d+)",
+                    log_content, re.IGNORECASE
                 )
+                if ch_mismatch:
+                    iface_ch = ch_mismatch.group(2)
+                    ap_ch = ch_mismatch.group(3)
+                    reasons.insert(0, f"⚠ CANAL INCORRECTO: interfaz en CH{iface_ch} pero AP en CH{ap_ch}")
+                    channel_issue_detected = True
+                    yield {
+                        "type": "warning",
+                        "message": f"Detectado desajuste de canal: interfaz en {iface_ch}, AP en {ap_ch}. Reconfigurando...",
+                    }
+
+                if "No such device" in log_tail:
+                    reasons.insert(0, "interfaz no encontrada")
+                elif "fixed channel" in log_tail.lower() and not channel_issue_detected:
+                    reasons.append("problema con canal fijo")
+                elif "Waiting for beacon" in log_content and not channel_issue_detected:
+                    reasons.append("esperando beacon del AP — verifica que esté encendido y en rango")
+
+            if not os.path.exists(cap_file):
+                if not channel_issue_detected:
+                    reasons.append(
+                        "no se creó el cap file — verifica modo monitor (airmon-ng start wlanX)"
+                    )
             else:
                 size = os.path.getsize(cap_file)
                 if size < 200:
@@ -303,13 +557,6 @@ class AttackerService:
                         f"tráfico capturado ({size // 1024}KB) pero sin 4-way handshake "
                         "— los clientes no se reconectaron"
                     )
-            if os.path.exists(log_path):
-                with open(log_path) as fh:
-                    log_tail = fh.read()[-800:]
-                if "No such device" in log_tail:
-                    reasons.insert(0, "interfaz no encontrada")
-                elif "fixed channel" in log_tail.lower():
-                    reasons.append("canal fijado — prueba sin especificar canal")
 
             diagnostic = "; ".join(reasons) if reasons else "razón desconocida"
             yield {
@@ -332,6 +579,131 @@ class AttackerService:
                     "3) Canal correcto y proximidad al AP. "
                     "4) Intenta con cliente objetivo (-c MAC)."
                 ),
+            }
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Client scanning — focused airodump-ng on a specific AP
+    # ──────────────────────────────────────────────────────────────────────────
+
+    async def scan_clients(
+        self,
+        interface: str,
+        bssid: str,
+        channel: int,
+        duration: int = 15,
+    ) -> AsyncIterator[dict]:
+        """Scan for clients associated with *bssid* on *channel*.
+
+        Runs airodump-ng for *duration* seconds, re-parsing the STATION CSV
+        section every 2 seconds, and yields ``client`` / ``client_update``
+        events for each discovered MAC.
+        """
+        attack_id = str(uuid.uuid4())
+        cap_dir = os.path.join(
+            settings.work_dir,
+            f"scan_{bssid.replace(':', '')}_{attack_id[:8]}",
+        )
+        os.makedirs(cap_dir, exist_ok=True)
+        output_prefix = os.path.join(cap_dir, "scan")
+        csv_path = f"{output_prefix}-01.csv"
+
+        yield {
+            "type": "start",
+            "message": f"Escaneando clientes en {bssid} (CH {channel}, {duration}s)…",
+        }
+
+        # ── Set interface to target channel BEFORE scan ───────────────────────
+        # Note: Even if this fails, airodump-ng will try to set the channel with -c flag
+        ch_ok, ch_msg = await _set_interface_channel(interface, channel)
+        if not ch_ok:
+            yield {"type": "warning", "message": f"⚠ {ch_msg}. Airodump-ng intentará configurar el canal."}
+        else:
+            yield {"type": "step", "message": f"✓ Canal {channel} configurado"}
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "airodump-ng",
+                "-c", str(channel),
+                "--bssid", bssid,
+                "-w", output_prefix,
+                "--output-format", "csv",
+                "--write-interval", "2",
+                "--ignore-negative-one",
+                interface,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except Exception as e:
+            logger.error(f"Failed to start airodump-ng for client scan: {e}")
+            yield {"type": "error", "message": f"Error al iniciar airodump-ng: {e}"}
+            return
+
+        process_manager.register(attack_id, proc, "scan_clients", bssid)
+
+        seen_macs: set[str] = set()
+        seen_packets: dict[str, int] = {}
+
+        try:
+            elapsed = 0
+            while elapsed < duration:
+                await asyncio.sleep(2)
+                elapsed += 2
+
+                if proc.returncode is not None:
+                    yield {
+                        "type": "error",
+                        "message": "airodump-ng terminó inesperadamente — verifica modo monitor.",
+                    }
+                    return
+
+                if not os.path.exists(csv_path):
+                    continue
+
+                for client in _airodump.parse_clients_csv(csv_path, bssid):
+                    mac = client["mac"]
+                    if mac not in seen_macs:
+                        seen_macs.add(mac)
+                        seen_packets[mac] = client["packets"]
+                        yield {
+                            "type": "client",
+                            "message": f"Cliente detectado: {mac}",
+                            "data": client,
+                        }
+                    elif client["packets"] != seen_packets.get(mac):
+                        seen_packets[mac] = client["packets"]
+                        yield {
+                            "type": "client_update",
+                            "message": f"Actualizado: {mac}",
+                            "data": client,
+                        }
+
+                yield {
+                    "type": "progress",
+                    "message": f"Escaneando… {elapsed}/{duration}s — {len(seen_macs)} cliente(s)",
+                    "progress": int(elapsed / duration * 100),
+                }
+
+        except asyncio.CancelledError:
+            yield {"type": "warning", "message": "Escaneo cancelado por el usuario."}
+        finally:
+            try:
+                proc.terminate()
+                await asyncio.wait_for(proc.wait(), timeout=3)
+            except (ProcessLookupError, asyncio.TimeoutError):
+                pass
+            process_manager.mark_done(attack_id)
+
+        if seen_macs:
+            yield {
+                "type": "done",
+                "message": f"{len(seen_macs)} cliente(s) encontrado(s)",
+                "data": {"count": len(seen_macs)},
+            }
+        else:
+            yield {
+                "type": "done",
+                "message": "Sin clientes detectados — puede que no haya dispositivos conectados o estén en canales distintos.",
+                "data": {"count": 0},
             }
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -362,6 +734,13 @@ class AttackerService:
 
         attack_id = str(uuid.uuid4())
         yield {"type": "start", "message": f"Iniciando ataque WPS ({mode}) contra {bssid}", "tool": "reaver"}
+
+        # ── Set interface to target channel BEFORE WPS attack ─────────────────
+        ch_ok, ch_msg = await _set_interface_channel(interface, channel)
+        if not ch_ok:
+            yield {"type": "warning", "message": f"No se pudo configurar canal: {ch_msg}. Continuando..."}
+        else:
+            yield {"type": "step", "message": f"✓ Canal {channel} configurado"}
 
         # Build reaver command
         args = [

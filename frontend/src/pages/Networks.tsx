@@ -38,18 +38,21 @@ export function Networks() {
           <label className="text-xs text-gray-500">Duración (s)</label>
           <input
             type="number"
-            className="bg-dark-700 border border-dark-500 rounded px-2 py-1 text-xs font-mono text-gray-200 w-20 focus:outline-none focus:border-brand-500"
+            className="bg-dark-700 border border-dark-500 rounded px-2 py-1.5 text-xs font-mono text-gray-200 w-20 focus:outline-none focus:border-brand-500"
             value={duration}
             onChange={(e) => setDuration(Number(e.target.value))}
           />
         </div>
-        <button
-          onClick={handleScan}
-          disabled={scanning}
-          className="px-5 py-1.5 rounded bg-brand-600 hover:bg-brand-500 disabled:bg-dark-600 disabled:text-gray-500 text-white text-xs font-bold transition-colors"
-        >
-          {scanning ? 'ESCANEANDO...' : 'ESCANEAR'}
-        </button>
+        <div className="flex flex-col gap-1">
+          <span className="text-xs text-transparent select-none" aria-hidden>_</span>
+          <button
+            onClick={handleScan}
+            disabled={scanning}
+            className="px-5 py-1.5 rounded bg-brand-600 hover:bg-brand-500 disabled:bg-dark-600 disabled:text-gray-500 text-white text-xs font-bold transition-colors"
+          >
+            {scanning ? 'ESCANEANDO...' : 'ESCANEAR'}
+          </button>
+        </div>
       </div>
 
       {/* Attack panel */}

@@ -9,10 +9,11 @@ const ATTACK_BADGE: Record<string, string> = {
 }
 
 export function Credentials() {
-  const { credentials, loading, fetchCredentials, deleteCredential } = useCredentialsStore()
+  const { credentials, loading, fetchCredentials, deleteCredential, handshakes, loadingHandshakes, fetchHandshakes, deleteHandshake } = useCredentialsStore()
   const [search, setSearch] = useState('')
 
   useEffect(() => { fetchCredentials() }, [fetchCredentials])
+  useEffect(() => { fetchHandshakes() }, [fetchHandshakes])
 
   const filtered = credentials.filter((c) =>
     c.bssid.toLowerCase().includes(search.toLowerCase()) ||
@@ -38,6 +39,60 @@ export function Credentials() {
         value={search}
         onChange={(e) => setSearch(e.target.value)}
       />
+
+      {/* Hashes / Handshakes */}
+      <div className="space-y-2">
+        <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-widest">Hashes Capturados</h2>
+        {loadingHandshakes ? (
+          <div className="text-gray-500 text-sm animate-pulse">Cargando hashes...</div>
+        ) : handshakes.length === 0 ? (
+          <div className="text-center text-gray-600 py-6 text-sm">Sin hashes capturados.</div>
+        ) : (
+          <div className="bg-dark-800 border border-dark-600 rounded overflow-x-auto">
+            <table className="w-full text-xs font-mono">
+              <thead>
+                <tr className="text-gray-500 border-b border-dark-600">
+                  <th className="text-left py-2 px-3">Red</th>
+                  <th className="text-left py-2 px-3">Tipo</th>
+                  <th className="text-left py-2 px-3">Verificado</th>
+                  <th className="text-left py-2 px-3">Capturado</th>
+                  <th className="text-left py-2 px-3">Acciones</th>
+                </tr>
+              </thead>
+              <tbody>
+                {handshakes.map((h) => (
+                  <tr key={h.id} className="border-b border-dark-700 hover:bg-dark-700 transition-colors">
+                    <td className="py-2 px-3">
+                      <div className="text-gray-200">{h.ssid ?? <span className="text-gray-600 italic">oculto</span>}</div>
+                      <div className="text-gray-500 text-[10px]">{h.bssid}</div>
+                    </td>
+                    <td className="py-2 px-3">
+                      <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-dark-600 text-gray-300 uppercase">{h.file_type}</span>
+                    </td>
+                    <td className="py-2 px-3">
+                      {h.verified
+                        ? <span className="text-green-400 font-bold">✓</span>
+                        : <span className="text-gray-600">—</span>}
+                    </td>
+                    <td className="py-2 px-3 text-gray-500">{new Date(h.captured_at).toLocaleString()}</td>
+                    <td className="py-2 px-3">
+                      <button
+                        onClick={() => deleteHandshake(h.id)}
+                        className="px-2.5 py-1 rounded bg-dark-600 hover:bg-red-900 text-gray-400 hover:text-red-300 text-xs font-bold transition-colors"
+                      >
+                        DEL
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* Credentials */}
+      <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-widest pt-2">Contraseñas Crackeadas</h2>
 
       {loading ? (
         <div className="text-gray-500 text-sm animate-pulse">Cargando credenciales...</div>
@@ -79,14 +134,14 @@ export function Credentials() {
                     <div className="flex gap-2">
                       <button
                         onClick={() => handleCopy(c.bssid)}
-                        className="px-2 py-0.5 rounded bg-dark-600 hover:bg-dark-500 text-gray-400 hover:text-gray-200 text-[10px] transition-colors"
+                        className="px-2.5 py-1 rounded bg-dark-600 hover:bg-dark-500 text-gray-400 hover:text-gray-200 text-xs font-bold transition-colors"
                         title="Copiar BSSID"
                       >
                         BSSID
                       </button>
                       <button
                         onClick={() => deleteCredential(c.id)}
-                        className="px-2 py-0.5 rounded bg-dark-600 hover:bg-red-900 text-gray-400 hover:text-red-300 text-[10px] transition-colors"
+                        className="px-2.5 py-1 rounded bg-dark-600 hover:bg-red-900 text-gray-400 hover:text-red-300 text-xs font-bold transition-colors"
                       >
                         DEL
                       </button>

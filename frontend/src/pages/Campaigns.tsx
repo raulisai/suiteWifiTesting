@@ -56,14 +56,14 @@ function CampaignRow({
           {campaign.status === 'running' && (
             <button
               onClick={(e) => { e.stopPropagation(); onStop(campaign.id) }}
-              className="px-2 py-0.5 rounded bg-yellow-700 hover:bg-yellow-600 text-white text-[10px] font-bold"
+              className="px-2.5 py-1 rounded bg-yellow-700 hover:bg-yellow-600 text-white text-xs font-bold"
             >
               PAUSAR
             </button>
           )}
           <button
             onClick={(e) => { e.stopPropagation(); onDelete(campaign.id) }}
-            className="px-2 py-0.5 rounded bg-dark-600 hover:bg-red-900 text-gray-400 hover:text-red-300 text-[10px]"
+            className="px-2.5 py-1 rounded bg-dark-600 hover:bg-red-900 text-gray-400 hover:text-red-300 text-xs font-bold"
           >
             DEL
           </button>

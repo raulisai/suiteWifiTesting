@@ -13,6 +13,7 @@ from app.schemas.attack import (
     CrackRequest,
     HandshakeAttackRequest,
     PmkidAttackRequest,
+    ScanClientsRequest,
     WpsAttackRequest,
 )
 from app.services.attacker import attacker_service
@@ -47,6 +48,40 @@ async def stop_attack(attack_id: str):
 
 
 # ── WebSocket attack endpoints ────────────────────────────────────────────────
+
+@router.websocket("/scan-clients")
+async def scan_clients(
+    websocket: WebSocket,
+):
+    """Scan for clients associated with a specific AP using airodump-ng.
+
+    Sends ``ready`` first; client must reply with ``ScanClientsRequest`` JSON.
+    Streams ``client``, ``client_update``, ``progress``, and ``done`` events.
+    """
+    await websocket.accept()
+    await websocket.send_text(json.dumps({"type": "ready", "message": "Listo para escanear clientes"}))
+
+    try:
+        raw = await websocket.receive_text()
+        req = ScanClientsRequest(**json.loads(raw))
+    except Exception as exc:
+        await websocket.send_text(json.dumps({"type": "error", "message": str(exc)}))
+        await websocket.close()
+        return
+
+    try:
+        async for event in attacker_service.scan_clients(
+            interface=req.interface,
+            bssid=req.bssid,
+            channel=req.channel,
+            duration=req.duration,
+        ):
+            await websocket.send_text(json.dumps(event))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await websocket.close()
+
 
 @router.websocket("/handshake")
 async def handshake_attack(
