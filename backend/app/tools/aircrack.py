@@ -39,22 +39,32 @@ class AircrackTool(AsyncToolWrapper):
         Returns:
             Tuple of (has_handshake: bool, bssid: str | None).
         """
-        args: list[str] = []
+        # Pass /dev/null as wordlist so aircrack-ng runs non-interactively and
+        # exits immediately after printing the handshake count.  Without -w it
+        # blocks on stdin waiting for the user to pick a network / wordlist,
+        # causing every verification attempt to hang for the full timeout.
+        args: list[str] = ["-w", "/dev/null"]
         if bssid:
             args += ["-b", bssid]
         args.append(cap_file)
 
-        rc, stdout, stderr = await self.run(args, timeout=30)
+        rc, stdout, stderr = await self.run(args, timeout=15)
         output = stdout + stderr
 
-        # aircrack-ng prints: "1 handshake" or lists networks with handshake marker
-        if "handshake" in output.lower():
-            match = re.search(
+        # aircrack-ng prints "WPA (N handshake)" in the network list.
+        # We must check for N > 0 — "0 handshake" must NOT match.
+        # Pattern examples from aircrack-ng output:
+        #   "WPA (1 handshake)"   → found
+        #   "WPA (0 handshake)"   → NOT found
+        #   "No valid WPA handshakes found"  → NOT found
+        count_match = re.search(r"\((\d+)\s+handshake", output, re.IGNORECASE)
+        if count_match and int(count_match.group(1)) > 0:
+            bssid_match = re.search(
                 r"([0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:"
                 r"[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2})",
                 output,
             )
-            found_bssid = match.group(1) if match else None
+            found_bssid = bssid_match.group(1) if bssid_match else None
             return True, found_bssid
         return False, None
 

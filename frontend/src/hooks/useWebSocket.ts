@@ -97,7 +97,11 @@ export function useWebSocket({
 
     ws.onerror = () => {
       setStatus('error')
-      toast.error('WebSocket desconectado', `No se pudo conectar a ${path}.`)
+      toast.error(
+        'WebSocket sin conexión',
+        `No se pudo conectar a ${path}. Si el backend está caído, inicialo con:\n` +
+          'cd backend && sudo uvicorn main:app --host 0.0.0.0 --port 8000 --reload',
+      )
     }
 
     ws.onclose = () => {

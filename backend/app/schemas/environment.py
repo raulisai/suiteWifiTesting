@@ -36,3 +36,11 @@ class EnvironmentSummary(BaseModel):
 class ToolInstallRequest(BaseModel):
     binaries: list[str] | None = None   # None = install all missing
     only_missing: bool = True
+
+
+class MonitorModeResponse(BaseModel):
+    success: bool
+    interface: str                   # original interface (e.g. wlan0 or wlan0mon)
+    monitor_interface: str | None    # new monitor iface name, None when stopping
+    message: str
+    output: str = ""                 # raw stdout+stderr from airmon-ng

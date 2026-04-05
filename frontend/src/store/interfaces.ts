@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { environmentApi, type WifiInterface } from '../api/environment'
+import { getBackendStatus } from './backendStatus'
 
 interface InterfacesState {
   interfaces: WifiInterface[]
@@ -17,6 +18,8 @@ export const useInterfacesStore = create<InterfacesState>((set, get) => ({
   error: null,
 
   fetch: async () => {
+    // Don't fire a doomed request when the backend is already known to be down
+    if (getBackendStatus() === 'offline') return
     set({ loading: true, error: null })
     try {
       const list = await environmentApi.getInterfaces()

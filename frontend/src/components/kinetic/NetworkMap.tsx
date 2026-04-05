@@ -1911,7 +1911,14 @@ export function NetworkMap({ networks, scanning, onAttack, onStart, onStop, filt
       <RFNetworkPanel networks={networks} selected={selected} onSelect={setSelected} search={search} onSearch={setSearch} open={netOpen} onToggle={()=>setNetOpen(o=>!o)} />
 
       {/* radar canvas */}
-      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" style={{cursor:hovered?'pointer':'crosshair', zIndex:0}}
+      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" style={{
+        cursor: hovered ? 'pointer' : 'crosshair',
+        zIndex: 0,
+        transition: 'transform 450ms cubic-bezier(0.4,0,0.2,1), filter 450ms ease, opacity 450ms ease',
+        transform: attacking ? 'scale(1.08)' : 'scale(1)',
+        filter: attacking ? 'blur(4px) brightness(0.4) saturate(0.6)' : 'none',
+        opacity: attacking ? 0.6 : 1,
+      }}
         onMouseMove={onMouseMove} onMouseLeave={()=>setHovered(null)} onClick={onClick} />
 
       {/* ── scanning sonar overlay ── */}

@@ -60,7 +60,7 @@ class AsyncToolWrapper:
         proc = await asyncio.create_subprocess_exec(
             self.binary,
             *args,
-            stdin=asyncio.subprocess.PIPE if stdin else None,
+            stdin=asyncio.subprocess.PIPE if stdin else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

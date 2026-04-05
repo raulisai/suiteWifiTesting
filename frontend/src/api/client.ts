@@ -1,8 +1,13 @@
 import axios from 'axios'
 import { toast } from '../store/toasts'
 
-const BASE_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
+export const BASE_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
 const WS_BASE = BASE_URL.replace(/^http/, 'ws')
+
+// Suppress duplicate "no connection" toasts that flood when backend is down
+// and many parallel requests fail at once.
+const NETWORK_ERROR_COOLDOWN_MS = 8_000
+let _lastNetworkErrorTs = 0
 
 export const apiClient = axios.create({
   baseURL: BASE_URL,
@@ -36,8 +41,17 @@ apiClient.interceptors.response.use(
       'Error desconocido'
 
     if (!status) {
-      // Network error (backend no disponible, CORS, etc.)
-      toast.error('Sin conexión con el servidor', detail)
+      // Network error — backend is likely down. Throttle toasts so dozens of
+      // parallel failed requests don't stack up into a toast storm.
+      const now = Date.now()
+      if (now - _lastNetworkErrorTs > NETWORK_ERROR_COOLDOWN_MS) {
+        _lastNetworkErrorTs = now
+        toast.error(
+          'Sin conexión con el servidor',
+          `No se puede alcanzar ${BASE_URL}. Verificá que el backend esté corriendo:\n` +
+            'cd backend && sudo uvicorn main:app --host 0.0.0.0 --port 8000 --reload',
+        )
+      }
     } else if (status >= 500) {
       toast.error(`Error del servidor (${status})`, detail)
     } else if (status >= 400 && status !== 404) {

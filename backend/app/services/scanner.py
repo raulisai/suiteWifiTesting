@@ -12,6 +12,44 @@ from app.tools.airodump import AirodumpTool
 _airodump = AirodumpTool()
 
 
+async def _get_interface_type(interface: str) -> str | None:
+    """Return the ``iw dev`` type string for *interface*, or ``None`` if not found."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "iw", "dev",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+    except (FileNotFoundError, asyncio.TimeoutError):
+        return None
+
+    current_iface: str | None = None
+    for line in stdout.decode(errors="replace").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Interface "):
+            current_iface = stripped.split("Interface ", 1)[1].strip()
+        elif stripped.startswith("type ") and current_iface == interface:
+            return stripped.split("type ", 1)[1].strip()
+    return None
+
+
+async def _assert_monitor_mode(interface: str) -> None:
+    """Raise ``ValueError`` if *interface* is not in monitor mode."""
+    iface_type = await _get_interface_type(interface)
+    if iface_type is None:
+        raise ValueError(
+            f"La interfaz '{interface}' no fue encontrada. "
+            "Verifica que la antena esté conectada y ejecuta 'iw dev'."
+        )
+    if iface_type.lower() != "monitor":
+        raise ValueError(
+            f"La interfaz '{interface}' está en modo '{iface_type}', "
+            "pero se requiere modo monitor. "
+            "Actívalo primero desde el panel de Interfaces."
+        )
+
+
 class ScannerService:
     """Orchestrates network scanning using airodump-ng."""
 
@@ -68,6 +106,7 @@ class ScannerService:
         Returns:
             List of Network ORM objects that were created or updated.
         """
+        await _assert_monitor_mode(interface)
         raw_networks = await _airodump.scan_all(interface, duration)
         saved: list[Network] = []
 
@@ -95,6 +134,8 @@ class ScannerService:
         Yields:
             Network data dicts as they are parsed from airodump-ng's CSV output.
         """
+        await _assert_monitor_mode(interface)
+
         import tempfile
 
         work_dir = tempfile.mkdtemp(prefix="wifi_suite_scan_")

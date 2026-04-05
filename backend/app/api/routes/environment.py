@@ -3,10 +3,12 @@ import json
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
-from app.schemas.environment import EnvironmentSummary, ToolCheckResponse, ToolInstallRequest, WifiInterface
+from app.schemas.environment import EnvironmentSummary, MonitorModeResponse, ToolCheckResponse, ToolInstallRequest, WifiInterface
 from app.services.environment import environment_service
+from app.tools.airmon import AirmonTool
 
 router = APIRouter(prefix="/api/environment", tags=["environment"])
+_airmon = AirmonTool()
 
 
 @router.get("/summary", response_model=EnvironmentSummary)
@@ -107,6 +109,59 @@ async def install_one(binary: str):
     """Install a single tool by binary name."""
     success, output = await environment_service.install_one(binary)
     return {"success": success, "output": output}
+
+
+@router.post("/interfaces/{interface}/monitor/start", response_model=MonitorModeResponse)
+async def start_monitor(interface: str):
+    """Enable monitor mode on a wireless interface using airmon-ng.
+
+    Returns the name of the created monitor interface (e.g. wlan0mon)
+    and the raw airmon-ng output for debugging.
+    """
+    kill_output = ""
+    try:
+        kill_output = await _airmon.check_kill()
+    except Exception as exc:
+        kill_output = f"[check kill error] {exc}"
+
+    try:
+        mon_iface, start_output = await _airmon.start(interface)
+        full_output = (kill_output + "\n" + start_output).strip()
+        return MonitorModeResponse(
+            success=True,
+            interface=interface,
+            monitor_interface=mon_iface,
+            message=f"Modo monitor activado: {mon_iface}",
+            output=full_output,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={"message": str(exc), "output": kill_output},
+        )
+
+
+@router.post("/interfaces/{interface}/monitor/stop", response_model=MonitorModeResponse)
+async def stop_monitor(interface: str):
+    """Disable monitor mode on a monitor interface using airmon-ng.
+
+    Pass the monitor interface name (e.g. wlan0mon).
+    """
+    try:
+        stop_output = await _airmon.stop(interface)
+        managed_iface = interface.replace("mon", "")
+        return MonitorModeResponse(
+            success=True,
+            interface=interface,
+            monitor_interface=None,
+            message=f"Modo monitor desactivado: {managed_iface}",
+            output=stop_output.strip(),
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={"message": str(exc), "output": ""},
+        )
 
 
 @router.websocket("/install/stream")

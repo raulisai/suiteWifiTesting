@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import type { Credential, Handshake } from '../types/credential'
 import { credentialsApi } from '../api/credentials'
+import { getBackendStatus } from './backendStatus'
 
 interface CredentialsState {
   credentials: Credential[]
@@ -20,6 +21,7 @@ export const useCredentialsStore = create<CredentialsState>((set, get) => ({
   loadingHandshakes: false,
 
   fetchCredentials: async () => {
+    if (getBackendStatus() === 'offline') return
     set({ loading: true })
     try {
       const credentials = await credentialsApi.list()
@@ -35,6 +37,7 @@ export const useCredentialsStore = create<CredentialsState>((set, get) => ({
   },
 
   fetchHandshakes: async () => {
+    if (getBackendStatus() === 'offline') return
     set({ loadingHandshakes: true })
     try {
       const handshakes = await credentialsApi.listHandshakes()

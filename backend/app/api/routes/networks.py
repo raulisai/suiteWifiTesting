@@ -43,7 +43,10 @@ async def scan_networks(
 
     For live output use the ``/scan/stream`` WebSocket endpoint instead.
     """
-    return await scanner_service.start_scan(db, request.interface, request.duration)
+    try:
+        return await scanner_service.start_scan(db, request.interface, request.duration)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.websocket("/scan/stream")

@@ -22,6 +22,14 @@ export interface ToolInfo {
   version: string | null
 }
 
+export interface MonitorModeResponse {
+  success: boolean
+  interface: string
+  monitor_interface: string | null
+  message: string
+  output: string
+}
+
 export interface EnvironmentSummary {
   ready: boolean
   essential_total: number
@@ -59,5 +67,15 @@ export const environmentApi = {
   installOne: (binary: string) =>
     apiClient
       .post<{ success: boolean; output: string }>(`/api/environment/install/${binary}`)
+      .then((r) => r.data),
+
+  startMonitor: (iface: string) =>
+    apiClient
+      .post<MonitorModeResponse>(`/api/environment/interfaces/${iface}/monitor/start`)
+      .then((r) => r.data),
+
+  stopMonitor: (monIface: string) =>
+    apiClient
+      .post<MonitorModeResponse>(`/api/environment/interfaces/${monIface}/monitor/stop`)
       .then((r) => r.data),
 }

@@ -1,5 +1,6 @@
 import { useNetworks } from '../hooks/useNetworks'
 import { EnvironmentStatus } from '../components/EnvironmentStatus'
+import { InterfacesPanel } from '../components/InterfacesPanel'
 import { SignalChart } from '../components/SignalChart'
 import { useAttacksStore } from '../store/attacks'
 import { useEffect } from 'react'
@@ -64,12 +65,21 @@ export function Dashboard() {
           <SignalChart networks={networks} />
         </div>
 
-        {/* Environment */}
-        <div className="bg-dark-800 border border-dark-600 rounded p-4">
-          <h2 className="text-sm font-bold text-gray-400 mb-3 uppercase tracking-wider">
-            Estado del Entorno
-          </h2>
-          <EnvironmentStatus />
+        {/* Right column: interfaces + environment */}
+        <div className="space-y-4">
+          <div className="bg-dark-800 border border-dark-600 rounded p-4">
+            <h2 className="text-sm font-bold text-gray-400 mb-3 uppercase tracking-wider">
+              Interfaces WiFi
+            </h2>
+            <InterfacesPanel />
+          </div>
+
+          <div className="bg-dark-800 border border-dark-600 rounded p-4">
+            <h2 className="text-sm font-bold text-gray-400 mb-3 uppercase tracking-wider">
+              Estado del Entorno
+            </h2>
+            <EnvironmentStatus />
+          </div>
         </div>
       </div>
     </div>
